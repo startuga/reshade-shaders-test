@@ -7,8 +7,8 @@
  * filter. This method sharpens details while preserving edges, avoiding common
  * halo artifacts.
  *
- * VERSION 2.0: Includes a high-quality spiral sampling mode for improved
- *              visual results and efficiency.
+ * VERSION 2.2: Fixed major structural error causing "unexpected 'unknown'"
+ *              compilation failure. Improved spatial weighting for higher quality.
  *
  * Key Features:
  * - Operates in a linear RGB color space for high-fidelity color calculations.
@@ -24,7 +24,7 @@
 
 // Set to 1 for a higher-quality, more efficient spiral sampling pattern.
 // Set to 0 for the original, brute-force square (box) sampling pattern.
-#define HIGH_QUALITY_SAMPLING 1
+#define HIGH_QUALITY_SAMPLING 0
 
 //==============================================================================
 // UI Configuration
@@ -86,13 +86,11 @@ static const float3 LUMINANCE_VECTOR = float3(0.2126, 0.7152, 0.0722);
 static const float EPSILON = 1e-6;
 
 // --- sRGB Conversions ---
-float3 SRGBToLinear(float3 srgb)
-{
+float3 SRGBToLinear(float3 srgb) {
     return srgb <= 0.04045 ? srgb / 12.92 : pow((srgb + 0.055) / 1.055, 2.4);
 }
 
-float3 LinearToSRGB(float3 linear_in)
-{
+float3 LinearToSRGB(float3 linear_in) {
     return linear_in <= 0.0031308 ? linear_in * 12.92 : 1.055 * pow(abs(linear_in), 1.0 / 2.4) - 0.055;
 }
 
@@ -162,6 +160,7 @@ float4 BilateralContrastPS(float4 pos : SV_Position, float2 texcoord : TEXCOORD0
 
     // 4. Apply the bilateral filter to the luminance channel.
     float sigma_range_sq = pow(SigmaRange, 2.0);
+    float sigma_spatial_sq = pow(Radius, 2.0);
     float total_weight = 1.0; // Start at 1 for the center pixel
     float filtered_luma = luma_center;
 
@@ -178,51 +177,69 @@ float4 BilateralContrastPS(float4 pos : SV_Position, float2 texcoord : TEXCOORD0
     [unroll]
     for(int i = 0; i < 24; i++)
     {
-        float2 offset = offsets[i] * scale * float2(BUFFER_RCP_WIDTH, BUFFER_RCP_HEIGHT);
+        float2 pixel_offset = offsets[i] * scale;
+        float2 uv_offset = pixel_offset * float2(BUFFER_RCP_WIDTH, BUFFER_RCP_HEIGHT);
+        
+        float4 color_sample = tex2Dlod(samplerColor, float4(texcoord + uv_offset, 0, 0));
+        float3 linear_sample;
+        #if BUFFER_COLOR_SPACE == 1
+            linear_sample = SRGBToLinear(color_sample.rgb);
+        #elif BUFFER_COLOR_SPACE == 2
+            linear_sample = color_sample.rgb;
+        #elif BUFFER_COLOR_SPACE == 3
+            linear_sample = PQToLinear(color_sample.rgb);
+        #elif BUFFER_COLOR_SPACE == 4
+            linear_sample = HLGToLinear(color_sample.rgb);
+        #else
+            linear_sample = SRGBToLinear(color_sample.rgb);
+        #endif
+        float luma_sample = dot(linear_sample, LUMINANCE_VECTOR);
+
+        float dist_sq = dot(pixel_offset, pixel_offset);
+        float weight_spatial = exp(-dist_sq / (2.0 * sigma_spatial_sq));
+        float luma_diff = luma_sample - luma_center;
+        float weight_range = exp(-(luma_diff * luma_diff) / (2.0 * sigma_range_sq));
+        float weight = weight_spatial * weight_range;
+
+        filtered_luma += luma_sample * weight;
+        total_weight += weight;
+    }
 #else
     // --- Standard Square (Box) Sampling ---
-    [unroll]
     for (int y = -Radius; y <= Radius; ++y)
     {
-        [unroll]
         for (int x = -Radius; x <= Radius; ++x)
         {
-            if (x == 0 && y == 0) continue; // Skip center pixel
-            float2 offset = float2(x, y) * float2(BUFFER_RCP_WIDTH, BUFFER_RCP_HEIGHT);
-#endif
-            // --- Common Sampling and Weighting Logic ---
-            float4 color_sample = tex2Dlod(samplerColor, float4(texcoord + offset, 0, 0));
+            if (x == 0 && y == 0) continue;
+            
+            float2 uv_offset = float2(x, y) * float2(BUFFER_RCP_WIDTH, BUFFER_RCP_HEIGHT);
+            
+            float4 color_sample = tex2Dlod(samplerColor, float4(texcoord + uv_offset, 0, 0));
             float3 linear_sample;
-
-#if BUFFER_COLOR_SPACE == 1
-            linear_sample = SRGBToLinear(color_sample.rgb);
-#elif BUFFER_COLOR_SPACE == 2
-            linear_sample = color_sample.rgb;
-#elif BUFFER_COLOR_SPACE == 3
-            linear_sample = PQToLinear(color_sample.rgb);
-#elif BUFFER_COLOR_SPACE == 4
-            linear_sample = HLGToLinear(color_sample.rgb);
-#else
-            linear_sample = SRGBToLinear(color_sample.rgb);
-#endif
+            #if BUFFER_COLOR_SPACE == 1
+                linear_sample = SRGBToLinear(color_sample.rgb);
+            #elif BUFFER_COLOR_SPACE == 2
+                linear_sample = color_sample.rgb;
+            #elif BUFFER_COLOR_SPACE == 3
+                linear_sample = PQToLinear(color_sample.rgb);
+            #elif BUFFER_COLOR_SPACE == 4
+                linear_sample = HLGToLinear(color_sample.rgb);
+            #else
+                linear_sample = SRGBToLinear(color_sample.rgb);
+            #endif
             float luma_sample = dot(linear_sample, LUMINANCE_VECTOR);
 
-            // Calculate spatial weight (distance from center)
-            float dist_sq = dot(offset, offset);
-            float weight_spatial = exp(-dist_sq * 0.5); // Simplified Gaussian
-
-            // Calculate range weight (luminance difference)
+            float dist_sq = x * x + y * y;
+            float weight_spatial = exp(-dist_sq / (2.0 * sigma_spatial_sq));
             float luma_diff = luma_sample - luma_center;
             float weight_range = exp(-(luma_diff * luma_diff) / (2.0 * sigma_range_sq));
-
             float weight = weight_spatial * weight_range;
 
             filtered_luma += luma_sample * weight;
             total_weight += weight;
-#if !HIGH_QUALITY_SAMPLING
         }
-#endif
     }
+#endif
 
     filtered_luma /= total_weight;
 
@@ -236,10 +253,8 @@ float4 BilateralContrastPS(float4 pos : SV_Position, float2 texcoord : TEXCOORD0
     float3 new_linear_rgb = linear_rgb * luma_ratio;
 
     // 7. Convert the result back to the original output color space.
-    float3 final_rgb;
 #if BUFFER_COLOR_SPACE == 1 // sRGB
-    final_rgb = LinearToSRGB(new_linear_rgb);
-    return float4(saturate(final_rgb), color_in.a);
+    return float4(saturate(LinearToSRGB(new_linear_rgb)), color_in.a);
 #elif BUFFER_COLOR_SPACE == 2 // scRGB
     return float4(new_linear_rgb, color_in.a);
 #elif BUFFER_COLOR_SPACE == 3 // HDR10 PQ
@@ -247,8 +262,7 @@ float4 BilateralContrastPS(float4 pos : SV_Position, float2 texcoord : TEXCOORD0
 #elif BUFFER_COLOR_SPACE == 4 // HDR10 HLG
     return float4(LinearToHLG(new_linear_rgb), color_in.a);
 #else // Fallback
-    final_rgb = LinearToSRGB(new_linear_rgb);
-    return float4(saturate(final_rgb), color_in.a);
+    return float4(saturate(LinearToSRGB(new_linear_rgb)), color_in.a);
 #endif
 }
 
