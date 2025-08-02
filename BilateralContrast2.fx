@@ -7,8 +7,8 @@
  * filter. This method sharpens details while preserving edges, avoiding common
  * halo artifacts.
  *
- * VERSION 2.2: Fixed major structural error causing "unexpected 'unknown'"
- *              compilation failure. Improved spatial weighting for higher quality.
+ * VERSION 3.0: Implemented professional-grade default settings by decoupling
+ *              Filter Radius from Spatial Sigma for superior quality and control.
  *
  * Key Features:
  * - Operates in a linear RGB color space for high-fidelity color calculations.
@@ -24,7 +24,7 @@
 
 // Set to 1 for a higher-quality, more efficient spiral sampling pattern.
 // Set to 0 for the original, brute-force square (box) sampling pattern.
-#define HIGH_QUALITY_SAMPLING 0
+#define HIGH_QUALITY_SAMPLING 1
 
 //==============================================================================
 // UI Configuration
@@ -40,9 +40,16 @@ uniform float Strength <
 uniform int Radius <
     ui_type = "slider";
     ui_min = 1; ui_max = 16;
-    ui_label = "Filter Radius";
-    ui_tooltip = "Pixel radius of the bilateral filter.\nLarger values affect broader details and are more demanding on the GPU.";
-> = 7;
+    ui_label = "Filter Radius (Boundary)";
+    ui_tooltip = "Sets the boundary of the filter in pixels.\nThis has a large impact on performance.\nRecommended: 6";
+> = 6;
+
+uniform float SigmaSpatial <
+    ui_type = "slider";
+    ui_min = 0.5; ui_max = 16.0;
+    ui_label = "Spatial Sigma (Falloff)";
+    ui_tooltip = "Controls the spatial falloff (blurriness) of the filter within the radius.\nSmaller values give a sharper, more localized effect.\nRecommended: 2.0";
+> = 2.0;
 
 uniform float SigmaRange <
     ui_type = "slider";
@@ -160,8 +167,8 @@ float4 BilateralContrastPS(float4 pos : SV_Position, float2 texcoord : TEXCOORD0
 
     // 4. Apply the bilateral filter to the luminance channel.
     float sigma_range_sq = pow(SigmaRange, 2.0);
-    float sigma_spatial_sq = pow(Radius, 2.0);
-    float total_weight = 1.0; // Start at 1 for the center pixel
+    float sigma_spatial_sq = pow(SigmaSpatial, 2.0); // Use the dedicated sigma uniform
+    float total_weight = 1.0;
     float filtered_luma = luma_center;
 
 #if HIGH_QUALITY_SAMPLING
@@ -172,7 +179,7 @@ float4 BilateralContrastPS(float4 pos : SV_Position, float2 texcoord : TEXCOORD0
         float2(0, -2), float2(-1, -2), float2(-2, -2), float2(-2, -1), float2(-2, 0), float2(-2, 1), float2(-2, 2), float2(-1, 2)
     };
 
-    float scale = Radius / 2.0; // Scale spiral based on radius
+    float scale = Radius / 2.0;
 
     [unroll]
     for(int i = 0; i < 24; i++)
