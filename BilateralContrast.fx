@@ -29,9 +29,17 @@ uniform float Strength <
 uniform int Radius <
     ui_type = "slider";
     ui_min = 1; ui_max = 16;
-    ui_label = "Filter Radius";
-    ui_tooltip = "Pixel radius of the bilateral filter.\nLarger values affect broader details but are significantly more demanding on the GPU.";
-> = 7;
+    ui_label = "Filter Radius (Kernel Size)";
+    ui_tooltip = "Pixel radius of the bilateral filter (e.g., Radius 6 = 13x13 kernel).\nLarger values affect broader details but are significantly more demanding on the GPU.";
+> = 6; // Recommended Radius
+
+uniform float SigmaSpatial <
+    ui_type = "slider";
+    ui_min = 0.5; ui_max = 8.0;
+    ui_step = 0.1;
+    ui_label = "Spatial Sigma";
+    ui_tooltip = "Controls the blurriness/spread of the spatial filter.\nHigher values give more weight to distant pixels, resulting in a smoother effect.";
+> = 2.0; // Recommended Sigma
 
 uniform float SigmaRange <
     ui_type = "slider";
@@ -40,6 +48,7 @@ uniform float SigmaRange <
     ui_label = "Sigma Range (Edge Preservation)";
     ui_tooltip = "Luminance similarity threshold.\nLower values preserve more edges but may enhance noise.\nHigher values result in a smoother, more subtle effect.";
 > = 0.15;
+
 
 //==============================================================================
 // Textures and Samplers
@@ -59,6 +68,7 @@ sampler2D samplerColor
 
 // --- Constants ---
 static const float3 LUMINANCE_VECTOR = float3(0.2126, 0.7152, 0.0722);
+static const float EPSILON = 1e-6;
 
 // --- sRGB Conversions ---
 float3 SRGBToLinear(float3 srgb)
@@ -149,12 +159,15 @@ float4 BilateralContrastPS(float4 pos : SV_Position, float2 texcoord : TEXCOORD0
     float luma_center = dot(linear_rgb, LUMINANCE_VECTOR);
 
     // 4. Apply the bilateral filter to the luminance channel.
-    float sigma_spatial_sq = pow(Radius / 2.0, 2.0);
+    float sigma_spatial_sq = pow(SigmaSpatial, 2.0);
     float sigma_range_sq = pow(SigmaRange, 2.0);
 
     float total_weight = 0.0;
     float filtered_luma = 0.0;
 
+    // The [unroll] attribute has been removed to prevent compilation errors
+    // with large radius values. The compiler will generate a standard,
+    // efficient loop which is the correct approach for this algorithm.
     for (int y = -Radius; y <= Radius; ++y)
     {
         for (int x = -Radius; x <= Radius; ++x)
@@ -195,11 +208,11 @@ float4 BilateralContrastPS(float4 pos : SV_Position, float2 texcoord : TEXCOORD0
     // 5. Calculate the enhanced luminance.
     float detail = luma_center - filtered_luma;
     float enhanced_luma = luma_center + detail * Strength;
-    enhanced_luma = max(1e-6, enhanced_luma); // or keep as max(0.0, ...)
+    enhanced_luma = max(EPSILON, enhanced_luma);
 
     // 6. Apply the luminance change back to the original linear color.
-    // This preserves hue and saturation.
-    float luma_ratio = enhanced_luma / max(luma_center, 1e-6);
+    // This preserves hue and saturation using a safe, branchless method.
+    float luma_ratio = enhanced_luma / max(luma_center, EPSILON);
     float3 new_linear_rgb = linear_rgb * luma_ratio;
 
     // 7. Convert the result back to the original output color space.
