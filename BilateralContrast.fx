@@ -31,7 +31,7 @@ uniform int Radius <
     ui_min = 1; ui_max = 16;
     ui_label = "Filter Radius (Kernel Size)";
     ui_tooltip = "Pixel radius of the bilateral filter (e.g., Radius 6 = 13x13 kernel).\nLarger values affect broader details but are significantly more demanding on the GPU.";
-> = 6; // Recommended Radius
+> = 6;
 
 uniform float SigmaSpatial <
     ui_type = "slider";
@@ -39,14 +39,14 @@ uniform float SigmaSpatial <
     ui_step = 0.1;
     ui_label = "Spatial Sigma";
     ui_tooltip = "Controls the blurriness/spread of the spatial filter.\nHigher values give more weight to distant pixels, resulting in a smoother effect.";
-> = 2.0; // Recommended Sigma
+> = 2.0;
 
 uniform float SigmaRange <
     ui_type = "slider";
     ui_min = 0.01; ui_max = 1.0;
     ui_step = 0.01;
     ui_label = "Sigma Range (Edge Preservation)";
-    ui_tooltip = "Luminance similarity threshold.\nLower values preserve more edges but may enhance noise.\nHigher values result in a smoother, more subtle effect.";
+    ui_tooltip = "Luminance similarity threshold.\nThis is a normalized value that is automatically scaled for HDR content to ensure consistent behavior.";
 > = 0.15;
 
 
@@ -143,14 +143,17 @@ float4 BilateralContrastPS(float4 pos : SV_Position, float2 texcoord : TEXCOORD0
 
     // 2. Convert the input color to a linear RGB working space.
     float3 linear_rgb;
+    float range_scale = 1.0; // Default scale for SDR
 #if BUFFER_COLOR_SPACE == 1 // sRGB
     linear_rgb = SRGBToLinear(color_in.rgb);
 #elif BUFFER_COLOR_SPACE == 2 // scRGB
     linear_rgb = color_in.rgb; // Already linear
 #elif BUFFER_COLOR_SPACE == 3 // HDR10 PQ
     linear_rgb = PQToLinear(color_in.rgb);
+    range_scale = 100.0; // Scale range for high-nit PQ space
 #elif BUFFER_COLOR_SPACE == 4 // HDR10 HLG
     linear_rgb = HLGToLinear(color_in.rgb);
+    range_scale = 10.0; // Scale range for 1000-nit HLG space
 #else // Fallback for unknown color spaces
     linear_rgb = SRGBToLinear(color_in.rgb);
 #endif
@@ -160,14 +163,15 @@ float4 BilateralContrastPS(float4 pos : SV_Position, float2 texcoord : TEXCOORD0
 
     // 4. Apply the bilateral filter to the luminance channel.
     float sigma_spatial_sq = pow(SigmaSpatial, 2.0);
-    float sigma_range_sq = pow(SigmaRange, 2.0);
+    
+    // --- HDR FIX ---
+    // Scale the UI's SigmaRange to match the current color space's dynamic range.
+    float effective_sigma_range = SigmaRange * range_scale;
+    float sigma_range_sq = pow(effective_sigma_range, 2.0);
 
     float total_weight = 0.0;
     float filtered_luma = 0.0;
 
-    // The [unroll] attribute has been removed to prevent compilation errors
-    // with large radius values. The compiler will generate a standard,
-    // efficient loop which is the correct approach for this algorithm.
     for (int y = -Radius; y <= Radius; ++y)
     {
         for (int x = -Radius; x <= Radius; ++x)
