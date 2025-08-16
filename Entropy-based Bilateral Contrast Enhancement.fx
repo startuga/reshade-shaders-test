@@ -19,9 +19,9 @@
 #include "ReShade.fxh"
 
 // Define color space detection
-#define IS_SDR (BUFFER_COLOR_BIT_DEPTH == 8)
-#define IS_HDR10 (BUFFER_COLOR_BIT_DEPTH == 10)
-#define IS_SCRGB (BUFFER_COLOR_BIT_DEPTH == 16)
+#define IS_SDR (BUFFER_COLOR_SPACE == 1)
+#define IS_HDR10 (BUFFER_COLOR_SPACE == 3)
+#define IS_SCRGB (BUFFER_COLOR_SPACE == 2)
 
 // Luminance coefficients
 #if IS_HDR10
@@ -245,4 +245,5 @@ technique BilateralContrast {
         VertexShader = PostProcessVS;
         PixelShader = PS_BilateralContrast;
     }
+
 }
