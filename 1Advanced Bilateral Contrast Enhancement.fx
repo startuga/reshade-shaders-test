@@ -25,9 +25,9 @@ uniform float fStrength <
     ui_label = "Contrast Strength";
     ui_tooltip = "Controls the intensity of the micro-contrast enhancement.";
     ui_min = 0.0;
-    ui_max = 3.0;
+    ui_max = 4.0;
     ui_step = 0.05;
-> = 0.5;
+> = 1.0;
 
 uniform int iRadius <
     ui_type = "slider";
@@ -35,7 +35,7 @@ uniform int iRadius <
     ui_tooltip = "Pixel radius of the bilateral filter. Larger values affect broader details.";
     ui_min = 1;
     ui_max = 10;
-> = 3;
+> = 7;
 
 uniform float fSigmaSpatial <
     ui_type = "slider";
@@ -44,7 +44,7 @@ uniform float fSigmaSpatial <
     ui_min = 0.1;
     ui_max = 10.0;
     ui_step = 0.1;
-> = 1.5;
+> = 3.5;
 
 uniform float fSigmaRange <
     ui_type = "slider";
@@ -64,7 +64,7 @@ uniform float fDarkProtection <
     ui_min = 0.0;
     ui_max = 0.25; // A generous but focused range for protecting darks and lower mid-tones.
     ui_step = 0.001; // FIX: Increased step for better UI responsiveness
-> = 0.1;
+> = 0.01;
 
 // ==============================================================================
 // Color and Luminance Helpers (Namespace: Bilateral)
