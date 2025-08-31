@@ -23,9 +23,9 @@ uniform float fStrength <
     ui_label = "Contrast Strength";
     ui_tooltip = "Controls the intensity of the micro-contrast enhancement.";
     ui_min = 0.0;
-    ui_max = 3.0;
+    ui_max = 4.0;
     ui_step = 0.01;
-> = 0.5;
+> = 3;
 
 uniform int iRadius <
     ui_type = "slider";
@@ -33,7 +33,7 @@ uniform int iRadius <
     ui_tooltip = "Pixel radius of the bilateral filter. Larger values affect broader details.";
     ui_min = 1;
     ui_max = 12;
-> = 4;
+> = 7;
 
 uniform float fSigmaSpatial <
     ui_type = "slider";
@@ -41,9 +41,9 @@ uniform float fSigmaSpatial <
     ui_tooltip = "Standard deviation of the spatial Gaussian kernel.\n"
                  "Controls the spatial extent of the filter influence.";
     ui_min = 0.1;
-    ui_max = 15.0;
+    ui_max = 6.0;
     ui_step = 0.01;
-> = 2.0;
+> = 3.0;
 
 uniform float fSigmaRange <
     ui_type = "slider";
@@ -64,7 +64,7 @@ uniform float fDarkProtection <
     ui_min = 0.0;
     ui_max = 0.3;
     ui_step = 0.001;
-> = 0.12;
+> = 0;
 
 uniform float fEdgeThreshold <
     ui_type = "slider";
