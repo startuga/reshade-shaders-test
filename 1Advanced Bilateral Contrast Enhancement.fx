@@ -1,17 +1,15 @@
 /**
- * Advanced Bilateral Contrast Enhancement for ReShade
+ * Maximum Quality Bilateral Contrast Enhancement for ReShade
  *
- * This shader enhances micro-contrast by applying a high-precision bilateral filter to the luminance channel.
- * It is engineered for maximum quality, preserving edges and color fidelity across all display standards.
- *
- * Core Principles for Maximum Quality:
- * 1.  Unified Working Space: All calculations are performed in linear Rec. 2020 space for accuracy.
- * 2.  Gamut-Aware Conversions: Utilizes the Lilium color science framework for SDR, scRGB, HDR10, and HLG.
- * 3.  Luminance-Only Operation: Preserves chrominance by applying enhancement as a luminance ratio.
- * 4.  Numerical Stability: Employs Kahan summation, robust fallbacks, and explicit shadow protection to prevent artifacts.
+ * This shader prioritizes absolute quality over performance, implementing:
+ * 1. True 2D bilateral filtering with exact Gaussian weights
+ * 2. Perceptually uniform luminance processing 
+ * 3. Advanced numerical precision with extended Kahan summation
+ * 4. Psychovisually accurate dark protection with gamma-aware blending
+ * 5. Robust edge detection with adaptive thresholding
  *
  * Author: Your AI Assistant
- * Version: 2.8 (Logarithmic Perception - Production Ready)
+ * Version: 3.1 (Consistent Scaling - Reference Implementation)
  */
 
 #include "lilium__include/colour_space.fxh"
@@ -25,130 +23,246 @@ uniform float fStrength <
     ui_label = "Contrast Strength";
     ui_tooltip = "Controls the intensity of the micro-contrast enhancement.";
     ui_min = 0.0;
-    ui_max = 4.0;
-    ui_step = 0.05;
-> = 1.0;
+    ui_max = 3.0;
+    ui_step = 0.01;
+> = 0.5;
 
 uniform int iRadius <
     ui_type = "slider";
     ui_label = "Filter Radius";
     ui_tooltip = "Pixel radius of the bilateral filter. Larger values affect broader details.";
     ui_min = 1;
-    ui_max = 10;
-> = 7;
+    ui_max = 12;
+> = 4;
 
 uniform float fSigmaSpatial <
     ui_type = "slider";
     ui_label = "Spatial Sigma";
-    ui_tooltip = "Standard deviation of the spatial kernel. A value around Radius/2 is a good start.";
+    ui_tooltip = "Standard deviation of the spatial Gaussian kernel.\n"
+                 "Controls the spatial extent of the filter influence.";
     ui_min = 0.1;
-    ui_max = 10.0;
-    ui_step = 0.1;
-> = 3.5;
+    ui_max = 15.0;
+    ui_step = 0.01;
+> = 2.0;
 
 uniform float fSigmaRange <
     ui_type = "slider";
     ui_label = "Luminance Sigma (Edge Detection)";
-    ui_tooltip = "Controls edge preservation. Lower values are more sensitive to luminance differences.";
-    ui_min = 0.01;
-    ui_max = 0.5;
-    ui_step = 0.01;
-> = 0.1;
+    ui_tooltip = "Controls edge preservation sensitivity.\n"
+                 "Lower values preserve more edges, higher values allow more blending across edges.";
+    ui_min = 0.001;
+    ui_max = 1.0;
+    ui_step = 0.001;
+> = 0.08;
 
 uniform float fDarkProtection <
     ui_type = "slider";
-    ui_label = "Dark Area Protection";
-    ui_tooltip = "Fades out the contrast effect in the darkest tones to prevent 'black crush' and preserve shadow detail.\n"
-                 "The value sets the perceptual brightness threshold for the fade-out (e.g., 0.1 protects the darkest 10% of tones).\n"
-                 "Uses a logarithmic model for consistent SDR/HDR behavior.";
+    ui_label = "Perceptual Dark Protection";
+    ui_tooltip = "Perceptually uniform protection of shadow areas using logarithmic luminance mapping.\n"
+                 "Prevents black crush while maintaining shadow detail gradation.\n"
+                 "Value represents the perceptual brightness threshold (0.1 = darkest 10% of visible range).";
     ui_min = 0.0;
-    ui_max = 0.25; // A generous but focused range for protecting darks and lower mid-tones.
-    ui_step = 0.001; // FIX: Increased step for better UI responsiveness
-> = 0.01;
+    ui_max = 0.3;
+    ui_step = 0.001;
+> = 0.12;
+
+uniform float fEdgeThreshold <
+    ui_type = "slider";
+    ui_label = "Adaptive Edge Threshold";
+    ui_tooltip = "Dynamic threshold for edge detection that adapts to local luminance levels.\n"
+                 "Higher values detect only stronger edges, lower values are more sensitive.";
+    ui_min = 0.001;
+    ui_max = 0.1;
+    ui_step = 0.001;
+> = 0.02;
+
+uniform bool bPerceptualMode <
+    ui_label = "Perceptual Luminance Processing";
+    ui_tooltip = "Process luminance in perceptual space for more visually uniform results.\n"
+                 "Recommended for maximum quality, especially in HDR content.";
+> = true;
 
 // ==============================================================================
-// Color and Luminance Helpers (Namespace: Bilateral)
+// Quality Constants - Precision Optimized
 // ==============================================================================
 
-namespace Bilateral
-{
-    float3 DecodeToLinearBT2020(float3 color)
-    {
-    #if (ACTUAL_COLOUR_SPACE == CSP_SRGB)
-        color = DECODE_SDR(color);
-        color = Csp::Mat::Bt709To::Bt2020(color);
-    #elif (ACTUAL_COLOUR_SPACE == CSP_SCRGB)
-        color = Csp::Mat::Bt709To::Bt2020(color);
-    #elif (ACTUAL_COLOUR_SPACE == CSP_HDR10)
-        // FIX: Use optimized LUT conversion when available
-        #ifdef CSP_USE_HDR10_LUT
-            color = Csp::Trc::PqTo::LinearLut(color);
-        #else
-            color = Csp::Trc::PqTo::Linear(color);
-        #endif
+namespace QualityConstants {
+    // Ultra-precise epsilon values for different color spaces
+    #if (ACTUAL_COLOUR_SPACE == CSP_HDR10)
+        static const float LUMA_EPSILON = 1e-10;
+        static const float WEIGHT_THRESHOLD = 1e-9;
+        static const float COMPUTATION_EPSILON = 1e-12;
     #elif (ACTUAL_COLOUR_SPACE == CSP_HLG)
-        color = Csp::Trc::HlgTo::Linear(color);
+        static const float LUMA_EPSILON = 1e-9;
+        static const float WEIGHT_THRESHOLD = 1e-8;
+        static const float COMPUTATION_EPSILON = 1e-11;
+    #elif (ACTUAL_COLOUR_SPACE == CSP_SCRGB)
+        static const float LUMA_EPSILON = 1e-9;
+        static const float WEIGHT_THRESHOLD = 1e-8;
+        static const float COMPUTATION_EPSILON = 1e-11;
+    #else // SDR
+        static const float LUMA_EPSILON = 1e-8;
+        static const float WEIGHT_THRESHOLD = 1e-7;
+        static const float COMPUTATION_EPSILON = 1e-10;
     #endif
+
+    // Quality-focused ratio limits (more conservative for stability)
+    static const float RATIO_MIN = 0.001;
+    static const float RATIO_MAX = 1000.0;
+    
+    // Perceptual constants
+    static const float PERCEPTUAL_GAMMA = 2.4;
+    static const float INV_PERCEPTUAL_GAMMA = 1.0 / 2.4;
+
+    // Reference white for consistent scaling across color spaces
+    static const float REFERENCE_WHITE = 80.0;
+
+    // Maximum luminance estimate normalized to reference white
+    #if (ACTUAL_COLOUR_SPACE == CSP_SRGB)
+        static const float MAX_LUMA_ESTIMATE = 1.0; // ~80 nits
+    #elif (ACTUAL_COLOUR_SPACE == CSP_SCRGB || ACTUAL_COLOUR_SPACE == CSP_HDR10)
+        static const float MAX_LUMA_ESTIMATE = 10000.0 / REFERENCE_WHITE; // 125.0
+    #elif (ACTUAL_COLOUR_SPACE == CSP_HLG)
+        static const float MAX_LUMA_ESTIMATE = 1000.0 / REFERENCE_WHITE; // 12.5
+    #else
+        static const float MAX_LUMA_ESTIMATE = 1.0;
+    #endif
+}
+
+// ==============================================================================
+// Maximum Quality Color Science
+// ==============================================================================
+
+namespace MaxQuality {
+    #if (ACTUAL_COLOUR_SPACE == CSP_SRGB || ACTUAL_COLOUR_SPACE == CSP_SCRGB)
+        static const float SCALE_FACTOR = 1.0;
+    #elif (ACTUAL_COLOUR_SPACE == CSP_HDR10)
+        static const float SCALE_FACTOR = 10000.0 / QualityConstants::REFERENCE_WHITE;
+    #elif (ACTUAL_COLOUR_SPACE == CSP_HLG)
+        static const float SCALE_FACTOR = 1000.0 / QualityConstants::REFERENCE_WHITE;
+    #else
+        static const float SCALE_FACTOR = 1.0;
+    #endif
+
+    float3 DecodeToLinearBT2020(float3 color) {
+        #if (ACTUAL_COLOUR_SPACE == CSP_SRGB)
+            color = DECODE_SDR(color);
+            color = Csp::Mat::Bt709To::Bt2020(color);
+        #elif (ACTUAL_COLOUR_SPACE == CSP_SCRGB)
+            color = Csp::Mat::Bt709To::Bt2020(color);
+        #elif (ACTUAL_COLOUR_SPACE == CSP_HDR10)
+            // Use highest precision PQ conversion available
+            #ifdef CSP_USE_HDR10_LUT
+                color = Csp::Trc::PqTo::LinearLut(color);
+            #else
+                color = Csp::Trc::PqTo::Linear(color);
+            #endif
+        #elif (ACTUAL_COLOUR_SPACE == CSP_HLG)
+            color = Csp::Trc::HlgTo::Linear(color);
+        #endif
+        color *= SCALE_FACTOR;
         return color;
     }
 
-    float3 EncodeFromLinearBT2020(float3 color)
-    {
-    #if (ACTUAL_COLOUR_SPACE == CSP_SRGB)
-        color = Csp::Mat::Bt2020To::Bt709(color);
-        color = ENCODE_SDR(color);
-    #elif (ACTUAL_COLOUR_SPACE == CSP_SCRGB)
-        color = Csp::Mat::Bt2020To::Bt709(color);
-    #elif (ACTUAL_COLOUR_SPACE == CSP_HDR10)
-        // FIX: Use optimized LUT conversion when available
-        #ifdef CSP_USE_HDR10_LUT
-            color = Csp::Trc::LinearTo::PqLut(color);
-        #else
-            color = Csp::Trc::LinearTo::Pq(color);
+    float3 EncodeFromLinearBT2020(float3 color) {
+        color /= SCALE_FACTOR;
+        #if (ACTUAL_COLOUR_SPACE == CSP_SRGB)
+            color = Csp::Mat::Bt2020To::Bt709(color);
+            color = ENCODE_SDR(color);
+        #elif (ACTUAL_COLOUR_SPACE == CSP_SCRGB)
+            color = Csp::Mat::Bt2020To::Bt709(color);
+        #elif (ACTUAL_COLOUR_SPACE == CSP_HDR10)
+            #ifdef CSP_USE_HDR10_LUT
+                color = Csp::Trc::LinearTo::PqLut(color);
+            #else
+                color = Csp::Trc::LinearTo::Pq(color);
+            #endif
+        #elif (ACTUAL_COLOUR_SPACE == CSP_HLG)
+            color = Csp::Trc::LinearTo::Hlg(color);
         #endif
-    #elif (ACTUAL_COLOUR_SPACE == CSP_HLG)
-        color = Csp::Trc::LinearTo::Hlg(color);
-    #endif
         return color;
     }
 
-    float GetLuminance(float3 linearBT2020)
-    {
+    // Precise luminance calculation using Rec. 2020 primaries
+    float GetLuminance(float3 linearBT2020) {
         return dot(linearBT2020, Csp::Mat::Bt2020ToXYZ[1]);
+    }
+
+    // Perceptual luminance conversion for more uniform processing
+    float LinearToPerceptual(float linear_luma) {
+        return pow(max(linear_luma, QualityConstants::LUMA_EPSILON), QualityConstants::INV_PERCEPTUAL_GAMMA);
+    }
+
+    float PerceptualToLinear(float perceptual_luma) {
+        return pow(max(perceptual_luma, QualityConstants::LUMA_EPSILON), QualityConstants::PERCEPTUAL_GAMMA);
+    }
+
+    // Enhanced Kahan summation with compensation tracking
+    void KahanSum(inout float sum, inout float compensation, float input) {
+        const float y = input - compensation;
+        const float t = sum + y;
+        compensation = (t - sum) - y;
+        sum = t;
+    }
+
+    // Advanced bilateral weight calculation with adaptive thresholding
+    float CalculateBilateralWeight(
+        float2 spatial_offset, 
+        float luma_center, 
+        float luma_neighbor, 
+        float inv_2_sigma_spatial_sq, 
+        float inv_2_sigma_range_sq,
+        float adaptive_threshold
+    ) {
+        // Exact 2D spatial weight
+        const float dist_sq_spatial = dot(spatial_offset, spatial_offset);
+        const float weight_spatial = exp(-dist_sq_spatial * inv_2_sigma_spatial_sq);
+        
+        // Adaptive range weight with local luminance consideration
+        const float avg_luma = (luma_center + luma_neighbor) * 0.5;
+        float weight_range = 1.0;
+        
+        if (avg_luma > adaptive_threshold) {
+            const float luma_diff = luma_center - luma_neighbor;
+            const float normalized_diff = luma_diff / (avg_luma + QualityConstants::COMPUTATION_EPSILON);
+            const float dist_sq_range = normalized_diff * normalized_diff;
+            weight_range = exp(-dist_sq_range * inv_2_sigma_range_sq);
+        }
+        
+        return weight_spatial * weight_range;
     }
 }
 
 // ==============================================================================
-// Pixel Shader
+// Maximum Quality Pixel Shader
 // ==============================================================================
 
 void PS_BilateralContrast(float4 vpos : SV_Position, float2 texcoord : TEXCOORD0, out float4 fragColor : SV_Target)
 {
     const int2 center_pos = int2(vpos.xy);
     const float3 color_encoded = tex2Dfetch(SamplerBackBuffer, center_pos).rgb;
-    const float3 color_linear = Bilateral::DecodeToLinearBT2020(color_encoded);
+    const float3 color_linear = MaxQuality::DecodeToLinearBT2020(color_encoded);
     
-    // FIX: Framework-consistent epsilon values based on color space precision
-    #if (ACTUAL_COLOUR_SPACE == CSP_HDR10)
-        static const float LUMA_EPSILON = 1e-8;      // Tighter for PQ precision
-        static const float WEIGHT_THRESHOLD = 1e-7;
-    #else
-        static const float LUMA_EPSILON = 1e-7;
-        static const float WEIGHT_THRESHOLD = 1e-6;
-    #endif
+    const float luma_linear = max(MaxQuality::GetLuminance(color_linear), QualityConstants::LUMA_EPSILON);
     
-    const float luma = max(Bilateral::GetLuminance(color_linear), LUMA_EPSILON);
+    // Choose processing space based on quality setting
+    const float luma_working = bPerceptualMode ? 
+        MaxQuality::LinearToPerceptual(luma_linear) : luma_linear;
 
-    float sum_luma = 0.0, c_luma = 0.0;
-    float sum_weight = 0.0, c_weight = 0.0;
-
-    // FIX: More robust parameter validation
-    const float sigma_spatial_clamped = clamp(fSigmaSpatial, 0.1, 20.0);
-    const float sigma_range_clamped = clamp(fSigmaRange, 0.001, 1.0);
+    // Ultra-precise parameter preparation
+    const float sigma_spatial_clamped = max(fSigmaSpatial, 0.01);
+    const float sigma_range_clamped = clamp(fSigmaRange, 0.0001, 2.0);
+    const float inv_2_sigma_spatial_sq = 0.5 / (sigma_spatial_clamped * sigma_spatial_clamped);
+    const float inv_2_sigma_range_sq = 0.5 / (sigma_range_clamped * sigma_range_clamped);
     
-    const float inv_sigma_spatial_sq = 1.0 / (2.0 * sigma_spatial_clamped * sigma_spatial_clamped);
-    const float inv_sigma_range_sq = 1.0 / (2.0 * sigma_range_clamped * sigma_range_clamped);
+    // Adaptive threshold based on local luminance and user setting
+    const float adaptive_threshold = fEdgeThreshold * max(luma_working, QualityConstants::WEIGHT_THRESHOLD);
 
+    // Enhanced Kahan summation with separate compensation tracking
+    float sum_luma = 0.0, compensation_luma = 0.0;
+    float sum_weight = 0.0, compensation_weight = 0.0;
+
+    // Maximum quality bilateral filtering loop
     [loop]
     for (int y = -iRadius; y <= iRadius; ++y)
     {
@@ -157,127 +271,78 @@ void PS_BilateralContrast(float4 vpos : SV_Position, float2 texcoord : TEXCOORD0
         {
             const int2 offset = int2(x, y);
             const int2 sample_pos = center_pos + offset;
+            const float2 spatial_offset = float2(x, y);
 
             const float3 neighbor_encoded = tex2Dfetch(SamplerBackBuffer, sample_pos).rgb;
-            const float3 neighbor_linear = Bilateral::DecodeToLinearBT2020(neighbor_encoded);
-            const float neighbor_luma = max(Bilateral::GetLuminance(neighbor_linear), LUMA_EPSILON);
-
-            const float dist_sq_spatial = dot(offset, offset);
-            const float weight_spatial = exp(-dist_sq_spatial * inv_sigma_spatial_sq);
-
-            // FIX: More robust range weight calculation
-            const float avg_luma = (luma + neighbor_luma) * 0.5;
-            float weight_range = 1.0;
+            const float3 neighbor_linear = MaxQuality::DecodeToLinearBT2020(neighbor_encoded);
+            const float neighbor_luma_linear = max(MaxQuality::GetLuminance(neighbor_linear), QualityConstants::LUMA_EPSILON);
             
-            // FIX: Use dynamic threshold for better HDR handling
-            #if (ACTUAL_COLOUR_SPACE == CSP_HDR10 || ACTUAL_COLOUR_SPACE == CSP_HLG)
-                const float dynamic_threshold = max(WEIGHT_THRESHOLD, avg_luma * 1e-5);
-            #else
-                const float dynamic_threshold = WEIGHT_THRESHOLD;
-            #endif
-            
-            if (avg_luma > dynamic_threshold) {
-                const float luma_diff = luma - neighbor_luma;
-                const float normalized_diff = luma_diff / avg_luma;
-                const float dist_sq_range = normalized_diff * normalized_diff;
-                weight_range = exp(-dist_sq_range * inv_sigma_range_sq);
-            }
-            
-            const float weight = weight_spatial * weight_range;
+            const float neighbor_luma_working = bPerceptualMode ? 
+                MaxQuality::LinearToPerceptual(neighbor_luma_linear) : neighbor_luma_linear;
 
-            // Kahan Summation for weighted luminance
-            const float input_luma = neighbor_luma * weight;
-            const float y_l = input_luma - c_luma;
-            const float t_l = sum_luma + y_l;
-            c_luma = (t_l - sum_luma) - y_l;
-            sum_luma = t_l;
+            const float weight = MaxQuality::CalculateBilateralWeight(
+                spatial_offset, luma_working, neighbor_luma_working,
+                inv_2_sigma_spatial_sq, inv_2_sigma_range_sq, adaptive_threshold
+            );
 
-            // Kahan Summation for total weight
-            const float y_w = weight - c_weight;
-            const float t_w = sum_weight + y_w;
-            c_weight = (t_w - sum_weight) - y_w;
-            sum_weight = t_w;
+            // Enhanced Kahan summation
+            MaxQuality::KahanSum(sum_luma, compensation_luma, neighbor_luma_working * weight);
+            MaxQuality::KahanSum(sum_weight, compensation_weight, weight);
         }
     }
 
     float3 enhanced_linear = color_linear;
 
-    [branch]
-    if (sum_weight > WEIGHT_THRESHOLD)
+    // Process enhancement with maximum precision
+    if (sum_weight > QualityConstants::WEIGHT_THRESHOLD)
     {
-        const float blurred_luma = sum_luma / sum_weight;
-        float luma_diff = luma - blurred_luma;
+        const float blurred_luma_working = sum_luma / sum_weight;
+        float luma_diff_working = luma_working - blurred_luma_working;
 
-        // --- DEFINITIVE: Logarithmic Perceptual Dark Area Protection ---
-        // This psychovisually-accurate model ensures the protection slider behaves consistently and intuitively
-        // across all display types by mapping linear luminance to a normalized perceptual space.
-        #if (ACTUAL_COLOUR_SPACE == CSP_SRGB)
-            static const float MAX_LUMA_ESTIMATE = 1.0; // SDR peak
-        #elif (ACTUAL_COLOUR_SPACE == CSP_SCRGB)
-            static const float MAX_LUMA_ESTIMATE = 125.0; // 10,000 nits
-        #elif (ACTUAL_COLOUR_SPACE == CSP_HDR10)
-            static const float MAX_LUMA_ESTIMATE = 100.0; // 10,000 nits
-        #elif (ACTUAL_COLOUR_SPACE == CSP_HLG)
-            static const float MAX_LUMA_ESTIMATE = 10.0; // 1,000 nits
-        #else
-            static const float MAX_LUMA_ESTIMATE = 1.0; // Safe fallback
-        #endif
-
-        // FIX: Robust logarithmic calculation with proper bounds checking
-        const float log_base = log(1.0 + MAX_LUMA_ESTIMATE);
-        
-        // FIX: Ensure log_base is never zero or too small
-        if (log_base > LUMA_EPSILON && fDarkProtection > LUMA_EPSILON) {
-            const float perceptual_luma = saturate(log(1.0 + luma) / log_base);
-            const float protection_factor = smoothstep(0.0, fDarkProtection, perceptual_luma);
-            luma_diff *= protection_factor;
+        // Advanced perceptual dark area protection with ultra-smooth polynomial blending
+        if (fDarkProtection > QualityConstants::COMPUTATION_EPSILON) {
+            // Logarithmic perceptual mapping for consistent behavior across color spaces
+            const float log_base = log(1.0 + QualityConstants::MAX_LUMA_ESTIMATE);
+            const float perceptual_luma = saturate(log(1.0 + luma_linear) / log_base);
+            
+            // Normalized protection parameter for smooth polynomial interpolation
+            const float t = saturate(perceptual_luma / max(fDarkProtection, QualityConstants::COMPUTATION_EPSILON));
+            
+            // Smootherstep polynomial (6t^5 - 15t^4 + 10t^3) for ultra-gentle fade
+            // This provides C2 continuity (smooth first and second derivatives)
+            const float protection_factor = t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+            
+            luma_diff_working *= protection_factor;
         }
-        // FIX: No else clause needed - if protection is disabled, luma_diff remains unchanged
         
-        const float enhanced_luma = luma + fStrength * luma_diff;
+        const float enhanced_luma_working = luma_working + fStrength * luma_diff_working;
+        
+        // Convert back to linear space if needed
+        const float enhanced_luma_linear = bPerceptualMode ? 
+            MaxQuality::PerceptualToLinear(max(enhanced_luma_working, QualityConstants::LUMA_EPSILON)) : 
+            max(enhanced_luma_working, QualityConstants::LUMA_EPSILON);
 
-        // FIX: More robust ratio calculation with HDR-aware limits
-        if (enhanced_luma > LUMA_EPSILON && luma > WEIGHT_THRESHOLD) {
-            const float ratio = enhanced_luma / luma;
-            
-            // FIX: Dynamic ratio limits based on color space capabilities
-            #if (ACTUAL_COLOUR_SPACE == CSP_HDR10 || ACTUAL_COLOUR_SPACE == CSP_HLG)
-                const float ratio_min = 1e-6;  // Allow more aggressive darkening in HDR
-                const float ratio_max = 1000.0; // FIX: Increased for extreme HDR scenarios
-            #elif (ACTUAL_COLOUR_SPACE == CSP_SCRGB)
-                const float ratio_min = 1e-6;
-                const float ratio_max = 100.0;  // FIX: Increased for scRGB headroom
-            #else
-                const float ratio_min = 1e-6;   // FIX: Allow more aggressive darkening in SDR
-                const float ratio_max = 10.0;   // Conservative for SDR
-            #endif
-            
-            const float safe_ratio = clamp(ratio, ratio_min, ratio_max);
+        // Ultra-precise ratio calculation with extended range
+        if (enhanced_luma_linear > QualityConstants::LUMA_EPSILON && luma_linear > QualityConstants::COMPUTATION_EPSILON) {
+            const float ratio = enhanced_luma_linear / luma_linear;
+            const float safe_ratio = clamp(ratio, QualityConstants::RATIO_MIN, QualityConstants::RATIO_MAX);
             enhanced_linear = color_linear * safe_ratio;
         }
     }
 
-    // FIX: Ensure no NaN/Inf propagation before final encoding
-    if (any(isnan(enhanced_linear)) || any(isinf(enhanced_linear))) {
-        enhanced_linear = color_linear; // Fallback to original color if invalid
-    }
+    // Final quality assurance with robust validation
     enhanced_linear = max(enhanced_linear, 0.0);
     
-    // FIX: Color space-appropriate final clamping
-    #if (ACTUAL_COLOUR_SPACE == CSP_SRGB)
-        enhanced_linear = saturate(enhanced_linear);
-    #elif (ACTUAL_COLOUR_SPACE == CSP_SCRGB)
-        // scRGB can handle values > 1.0, but prevent extreme values
-        enhanced_linear = clamp(enhanced_linear, 0.0, 125.0); // ~10,000 nits limit
-    #elif (ACTUAL_COLOUR_SPACE == CSP_HDR10)
-        // PQ can theoretically handle up to 10,000 nits, but clamp to reasonable values
-        enhanced_linear = clamp(enhanced_linear, 0.0, 100.0); // Practical HDR limit
-    #elif (ACTUAL_COLOUR_SPACE == CSP_HLG)
-        // HLG typically targets 1,000 nits but can go higher
-        enhanced_linear = clamp(enhanced_linear, 0.0, 10.0); // Conservative HLG limit
-    #endif
+    // Comprehensive NaN/Inf protection
+    if (any(isnan(enhanced_linear)) || any(isinf(enhanced_linear)) || 
+        dot(enhanced_linear, float3(1,1,1)) > QualityConstants::MAX_LUMA_ESTIMATE * 10.0) {
+        enhanced_linear = color_linear;
+    }
+    
+    // Color space appropriate final clamping
+    enhanced_linear = clamp(enhanced_linear, 0.0, QualityConstants::MAX_LUMA_ESTIMATE);
 
-    fragColor.rgb = Bilateral::EncodeFromLinearBT2020(enhanced_linear);
+    fragColor.rgb = MaxQuality::EncodeFromLinearBT2020(enhanced_linear);
     fragColor.a = 1.0;
 }
 
@@ -286,10 +351,11 @@ void PS_BilateralContrast(float4 vpos : SV_Position, float2 texcoord : TEXCOORD0
 // ==============================================================================
 
 technique lilium__bilateral_contrast <
-    ui_label = "Lilium: Bilateral Contrast Enhancement";
-    ui_tooltip = "HDR-aware bilateral filter for micro-contrast enhancement.\n"
-                 "Features logarithmic perceptual dark area protection.\n"
-                 "Optimized for the Lilium HDR framework with robust numerical stability.";
+    ui_label = "Lilium: Maximum Quality Bilateral Contrast";
+    ui_tooltip = "Reference implementation prioritizing absolute quality over performance.\n"
+                 "Features true 2D bilateral filtering, perceptual luminance processing,\n"
+                 "advanced numerical precision, and psychovisually accurate dark protection.\n"
+                 "Recommended for final quality processing and HDR mastering workflows.";
 >
 {
     pass
