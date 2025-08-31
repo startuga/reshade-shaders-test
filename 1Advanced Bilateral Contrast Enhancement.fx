@@ -53,7 +53,7 @@ uniform float fSigmaRange <
     ui_min = 0.001;
     ui_max = 1.0;
     ui_step = 0.001;
-> = 0.08;
+> = 0.05;
 
 uniform float fDarkProtection <
     ui_type = "slider";
