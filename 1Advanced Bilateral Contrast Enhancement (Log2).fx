@@ -281,15 +281,6 @@ void PS_BilateralContrast(float4 vpos : SV_Position, float2 texcoord : TEXCOORD0
         enhanced_linear = color_linear;
     }
     
-    // --- CRITICAL FIX 2: Corrected HDR Clamping ---
-    // Preserve hue and saturation by scaling the color vector if its luminance exceeds the maximum,
-    // instead of using a component-wise clamp which distorts color.
-    const float enhanced_luma = ColorScience::GetLuminance(enhanced_linear);
-    if (enhanced_luma > Constants::MAX_LUMINANCE_LINEAR)
-    {
-        enhanced_linear *= (Constants::MAX_LUMINANCE_LINEAR / enhanced_luma);
-    }
-    
     fragColor.rgb = ColorScience::EncodeFromLinear(enhanced_linear);
     fragColor.a = 1.0;
 }
