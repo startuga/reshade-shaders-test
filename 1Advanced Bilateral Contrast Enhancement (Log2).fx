@@ -86,9 +86,9 @@ uniform bool bDebugMode <
 // ==============================================================================
 
 // Reference white levels for each color space (in nits)
-#if (ACTUAL_COLOUR_SPACE == CSP_SRGB || ACTUAL_COLOUR_SPACE == CSP_SCRGB)
+#if (ACTUAL_COLOUR_SPACE == CSP_SRGB)
     #define REFERENCE_WHITE_NITS 80.0
-#elif (ACTUAL_COLOUR_SPACE == CSP_HDR10)
+#elif (ACTUAL_COLOUR_SPACE == CSP_HDR10 || ACTUAL_COLOUR_SPACE == CSP_SCRGB)
     #define REFERENCE_WHITE_NITS 10000.0
 #elif (ACTUAL_COLOUR_SPACE == CSP_HLG)
     #define REFERENCE_WHITE_NITS 1000.0
@@ -99,9 +99,7 @@ uniform bool bDebugMode <
 // Normalized reference white for linear RGB space
 #if (ACTUAL_COLOUR_SPACE == CSP_SRGB)
     #define REFERENCE_WHITE_LINEAR 1.0  // SDR is normalized to 1.0
-#elif (ACTUAL_COLOUR_SPACE == CSP_SCRGB)
-    #define REFERENCE_WHITE_LINEAR 1.0  // scRGB uses SDR reference
-#elif (ACTUAL_COLOUR_SPACE == CSP_HDR10)
+#elif (ACTUAL_COLOUR_SPACE == CSP_HDR10 || ACTUAL_COLOUR_SPACE == CSP_SCRGB)
     #define REFERENCE_WHITE_LINEAR 125.0  // 10000/80
 #elif (ACTUAL_COLOUR_SPACE == CSP_HLG)
     #define REFERENCE_WHITE_LINEAR 12.5   // 1000/80
@@ -332,16 +330,6 @@ void PS_BilateralContrast(float4 vpos : SV_Position, float2 texcoord : TEXCOORD0
     if (any(isnan(enhanced_linear)) || any(isinf(enhanced_linear))) {
         enhanced_linear = color_linear;
     }
-    
-    // Clamp to maximum luminance for color space
-    float max_luminance = REFERENCE_WHITE_LINEAR * 2.0; // Allow 1 stop headroom
-    #if (ACTUAL_COLOUR_SPACE == CSP_HDR10)
-        max_luminance = 125.0 * 2.0; // 20,000 nits
-    #elif (ACTUAL_COLOUR_SPACE == CSP_HLG)
-        max_luminance = 12.5 * 2.0;  // 2,000 nits
-    #endif
-    
-    enhanced_linear = min(enhanced_linear, max_luminance);
     
     fragColor.rgb = EncodeFromLinearBT2020(enhanced_linear);
     fragColor.a = 1.0;
