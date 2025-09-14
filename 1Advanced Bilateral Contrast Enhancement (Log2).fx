@@ -4,18 +4,16 @@
  * This shader implements academically rigorous bilateral filtering with:
  * 1. Correct log2 luminance ratio processing (not absolute values)
  * 2. Proper Gaussian range kernel without threshold artifacts
- * 3. Weber's Law compliant shadow protection
+ * 3. Smoothed, perception-aligned shadow protection (Corrected)
  * 4. Unified SDR/HDR processing with correct reference whites
  * 5. Physically accurate color space conversions
+ * 6. Color-preserving luminance clamping for HDR (Corrected)
  *
- * Version: 4.0 (Complete Physical Accuracy Rewrite)
+ * Version: 4.1 (Correctness and Code Cleanup Pass)
  */
 
 #include "ReShade.fxh"
 #include "lilium__include/colour_space.fxh"
-
-// FIX: The line defining SamplerBackBuffer was removed from here,
-// as it is already defined in ReShade.fxh.
 
 // ==============================================================================
 // UI Configuration
@@ -24,18 +22,16 @@
 uniform float fStrength <
     ui_type = "slider";
     ui_label = "Contrast Strength";
-    ui_tooltip = "Controls the intensity of the micro-contrast enhancement.\n"
-                 "Acts as a multiplier on the difference between local and filtered luminance.";
+    ui_tooltip = "Controls the intensity of the micro-contrast enhancement.";
     ui_min = 0.0;
     ui_max = 4.0;
     ui_step = 0.01;
-> = 2.0;
+> = 3.0;
 
 uniform int iRadius <
     ui_type = "slider";
     ui_label = "Filter Radius";
-    ui_tooltip = "Pixel radius of the bilateral filter.\n"
-                 "Larger values affect broader spatial details.";
+    ui_tooltip = "Pixel radius of the bilateral filter.\nLarger values affect broader spatial details.";
     ui_min = 1;
     ui_max = 12;
 > = 7;
@@ -43,8 +39,7 @@ uniform int iRadius <
 uniform float fSigmaSpatial <
     ui_type = "slider";
     ui_label = "Spatial Sigma";
-    ui_tooltip = "Standard deviation of the spatial Gaussian kernel.\n"
-                 "Controls the spatial falloff of the filter influence.";
+    ui_tooltip = "Standard deviation of the spatial Gaussian kernel.";
     ui_min = 0.1;
     ui_max = 6.0;
     ui_step = 0.01;
@@ -52,286 +47,250 @@ uniform float fSigmaSpatial <
 
 uniform float fSigmaRange <
     ui_type = "slider";
-    ui_label = "Range Sigma (Luminance Ratio)";
-    ui_tooltip = "Controls edge preservation in log2 space.\n"
-                 "Value represents exposure stops difference tolerance:\n"
-                 "0.5 = preserves 2^0.5 = 1.41x luminance ratios\n"
-                 "1.0 = preserves 2^1.0 = 2.0x luminance ratios\n"
-                 "2.0 = preserves 2^2.0 = 4.0x luminance ratios";
+    ui_label = "Range Sigma (in Exposure Stops)";
+    ui_tooltip = "Controls edge preservation tolerance in log2 space (exposure stops).\n"
+                 "0.5 = Preserves 1.4x luminance ratios\n"
+                 "1.0 = Preserves 2.0x luminance ratios";
     ui_min = 0.1;
     ui_max = 3.0;
     ui_step = 0.01;
-> = 0.8;
+> = 0.30;
 
 uniform float fDarkProtection <
     ui_type = "slider";
-    ui_label = "Shadow Protection (% of Reference White)";
-    ui_tooltip = "Weber's Law compliant shadow protection.\n"
-                 "Value is percentage of reference white below which contrast is reduced:\n"
-                 "0.05 = protect below 5% of reference (4 nits in SDR, 500 nits in HDR10)\n"
-                 "0.10 = protect below 10% of reference (8 nits in SDR, 1000 nits in HDR10)";
+    ui_label = "Shadow Protection (% of Reference)";
+    ui_tooltip = "Threshold below which contrast is smoothly reduced, preventing black crush.\n"
+                 "Value is a percentage of the reference white level.";
     ui_min = 0.0;
     ui_max = 0.2;
     ui_step = 0.001;
-> = 0.05;
+> = 0.0;
 
 uniform bool bDebugMode <
-    ui_label = "Debug: Show Log2 Values";
+    ui_label = "Debug: Show Log2 Luminance";
     ui_tooltip = "Visualize the log2 luminance ratios being processed.\n"
-                 "Gray = 0 stops (reference white), Black = -10 stops, White = +3 stops";
+                 "Gray=0 stops, Black=-10 stops, White=+3 stops.";
 > = false;
 
 // ==============================================================================
-// Physically Accurate Constants
+// Constants & Utilities
 // ==============================================================================
 
-// Reference white levels for each color space (in nits)
-#if (ACTUAL_COLOUR_SPACE == CSP_SRGB)
-    #define REFERENCE_WHITE_NITS 80.0
-#elif (ACTUAL_COLOUR_SPACE == CSP_HDR10 || ACTUAL_COLOUR_SPACE == CSP_SCRGB)
-    #define REFERENCE_WHITE_NITS 10000.0
-#elif (ACTUAL_COLOUR_SPACE == CSP_HLG)
-    #define REFERENCE_WHITE_NITS 1000.0
-#else
-    #define REFERENCE_WHITE_NITS 80.0
-#endif
-
-// Normalized reference white for linear RGB space
-#if (ACTUAL_COLOUR_SPACE == CSP_SRGB)
-    #define REFERENCE_WHITE_LINEAR 1.0  // SDR is normalized to 1.0
-#elif (ACTUAL_COLOUR_SPACE == CSP_HDR10 || ACTUAL_COLOUR_SPACE == CSP_SCRGB)
-    #define REFERENCE_WHITE_LINEAR 125.0  // 10000/80
-#elif (ACTUAL_COLOUR_SPACE == CSP_HLG)
-    #define REFERENCE_WHITE_LINEAR 12.5   // 1000/80
-#else
-    #define REFERENCE_WHITE_LINEAR 1.0
-#endif
-
-// Precision constants
-#define LUMA_EPSILON 1e-8
-#define LOG2_MIN_RATIO 1e-6
-#define WEIGHT_THRESHOLD 1e-7
-
-// Ratio clamping for stability
-#define RATIO_MIN 0.001
-#define RATIO_MAX 1000.0
-
-// ==============================================================================
-// CORRECTED Color Space Conversions
-// ==============================================================================
-
-float3 DecodeToLinearBT2020(float3 color) {
+namespace Constants
+{
+    // Normalized reference white for the current color space's linear RGB representation
     #if (ACTUAL_COLOUR_SPACE == CSP_SRGB)
-        color = DECODE_SDR(color);
-        color = Csp::Mat::Bt709To::Bt2020(color);
-    #elif (ACTUAL_COLOUR_SPACE == CSP_SCRGB)
-        color = Csp::Mat::Bt709To::Bt2020(color);
-    #elif (ACTUAL_COLOUR_SPACE == CSP_HDR10)
-        #ifdef CSP_USE_HDR10_LUT
-            color = Csp::Trc::PqTo::LinearLut(color);
-        #else
+        static const float REFERENCE_WHITE_LINEAR = 1.0;  // SDR is normalized to 1.0
+    #elif (ACTUAL_COLOUR_SPACE == CSP_HDR10 || ACTUAL_COLOUR_SPACE == CSP_SCRGB)
+        static const float REFERENCE_WHITE_LINEAR = 125.0;  // 10,000 nits / 80 nits
+    #elif (ACTUAL_COLOUR_SPACE == CSP_HLG)
+        static const float REFERENCE_WHITE_LINEAR = 12.5;   // 1,000 nits / 80 nits
+    #else
+        static const float REFERENCE_WHITE_LINEAR = 1.0;
+    #endif
+    
+    // Allow for one stop of headroom over the reference white
+    static const float MAX_LUMINANCE_LINEAR = REFERENCE_WHITE_LINEAR * 2.0;
+
+    // Precision and stability constants
+    static const float LUMA_EPSILON = 1e-8f;
+    static const float LOG2_MIN_RATIO = 1e-6f;
+    static const float WEIGHT_THRESHOLD = 1e-7f;
+    static const float RATIO_MIN = 0.001f;
+    static const float RATIO_MAX = 1000.0f;
+}
+
+namespace FxUtils
+{
+    // Extended Kahan summation for improved numerical stability
+    void KahanSum(inout float sum, inout float compensation, const float input)
+    {
+        const float y = input - compensation;
+        const float t = sum + y;
+        compensation = (t - sum) - y;
+        sum = t;
+    }
+}
+
+// ==============================================================================
+// Color Science Pipeline
+// ==============================================================================
+
+namespace ColorScience
+{
+    float3 DecodeToLinear(float3 color)
+    {
+        #if (ACTUAL_COLOUR_SPACE == CSP_SRGB)
+            color = DECODE_SDR(color);
+            color = Csp::Mat::Bt709To::Bt2020(color);
+        #elif (ACTUAL_COLOUR_SPACE == CSP_SCRGB)
+            color = Csp::Mat::Bt709To::Bt2020(color);
+        #elif (ACTUAL_COLOUR_SPACE == CSP_HDR10)
             color = Csp::Trc::PqTo::Linear(color);
+        #elif (ACTUAL_COLOUR_SPACE == CSP_HLG)
+            color = Csp::Trc::HlgTo::Linear(color);
         #endif
-    #elif (ACTUAL_COLOUR_SPACE == CSP_HLG)
-        color = Csp::Trc::HlgTo::Linear(color);
-    #endif
-    
-    // Scale to absolute luminance scale
-    color *= REFERENCE_WHITE_LINEAR;
-    return color;
-}
+        
+        return color * Constants::REFERENCE_WHITE_LINEAR;
+    }
 
-float3 EncodeFromLinearBT2020(float3 color) {
-    // Scale back from absolute luminance
-    color /= REFERENCE_WHITE_LINEAR;
-    
-    #if (ACTUAL_COLOUR_SPACE == CSP_SRGB)
-        color = Csp::Mat::Bt2020To::Bt709(color);
-        color = ENCODE_SDR(color);
-    #elif (ACTUAL_COLOUR_SPACE == CSP_SCRGB)
-        color = Csp::Mat::Bt2020To::Bt709(color);
-    #elif (ACTUAL_COLOUR_SPACE == CSP_HDR10)
-        #ifdef CSP_USE_HDR10_LUT
-            color = Csp::Trc::LinearTo::PqLut(color);
-        #else
+    float3 EncodeFromLinear(float3 color)
+    {
+        color /= Constants::REFERENCE_WHITE_LINEAR;
+        
+        #if (ACTUAL_COLOUR_SPACE == CSP_SRGB)
+            color = Csp::Mat::Bt2020To::Bt709(color);
+            color = ENCODE_SDR(color);
+        #elif (ACTUAL_COLOUR_SPACE == CSP_SCRGB)
+            color = Csp::Mat::Bt2020To::Bt709(color);
+        #elif (ACTUAL_COLOUR_SPACE == CSP_HDR10)
             color = Csp::Trc::LinearTo::Pq(color);
+        #elif (ACTUAL_COLOUR_SPACE == CSP_HLG)
+            color = Csp::Trc::LinearTo::Hlg(color);
         #endif
-    #elif (ACTUAL_COLOUR_SPACE == CSP_HLG)
-        color = Csp::Trc::LinearTo::Hlg(color);
-    #endif
-    return color;
-}
+        
+        return color;
+    }
 
-float GetLuminanceBT2020(float3 linearBT2020) {
-    return dot(linearBT2020, Csp::Mat::Bt2020ToXYZ[1]);
-}
+    float GetLuminance(const float3 linearBT2020)
+    {
+        return dot(linearBT2020, Csp::Mat::Bt2020ToXYZ[1]);
+    }
 
-// ==============================================================================
-// CORRECTED Log2 Perceptual Processing
-// ==============================================================================
+    float LinearToLog2Ratio(const float linear_luma)
+    {
+        float ratio = linear_luma / Constants::REFERENCE_WHITE_LINEAR;
+        ratio = max(ratio, Constants::LOG2_MIN_RATIO);
+        return log2(ratio);
+    }
 
-// Convert linear luminance to log2 RATIO relative to reference white
-float LinearToLog2Ratio(float linear_luma) {
-    // Calculate ratio relative to reference white
-    float ratio = linear_luma / REFERENCE_WHITE_LINEAR;
-    
-    // Clamp to prevent log(0)
-    ratio = max(ratio, LOG2_MIN_RATIO);
-    
-    // Return log2 of the ratio (exposure stops from reference)
-    return log2(ratio);
-}
-
-// Convert log2 ratio back to linear luminance
-float Log2RatioToLinear(float log2_ratio) {
-    // exp2 gives us the ratio, multiply by reference to get absolute
-    return REFERENCE_WHITE_LINEAR * exp2(log2_ratio);
+    float Log2RatioToLinear(const float log2_ratio)
+    {
+        return Constants::REFERENCE_WHITE_LINEAR * exp2(log2_ratio);
+    }
 }
 
 // ==============================================================================
-// CORRECTED Bilateral Weight Calculation
+// Bilateral Filtering Core
 // ==============================================================================
 
-float CalculateBilateralWeight(
-    float2 spatial_offset,
-    float log2_center,
-    float log2_neighbor,
-    float inv_2_sigma_spatial_sq,
-    float inv_2_sigma_range_sq
-) {
-    // Spatial Gaussian weight (unchanged)
-    float dist_sq_spatial = dot(spatial_offset, spatial_offset);
-    float weight_spatial = exp(-dist_sq_spatial * inv_2_sigma_spatial_sq);
-    
-    // CORRECTED: Always apply Gaussian range weight
-    // In log2 space, difference is the ratio in stops
-    float log_ratio_diff = abs(log2_center - log2_neighbor);
-    float dist_sq_range = log_ratio_diff * log_ratio_diff;
-    float weight_range = exp(-dist_sq_range * inv_2_sigma_range_sq);
-    
-    return weight_spatial * weight_range;
-}
-
-// Extended Kahan summation for numerical stability
-void KahanSum(inout float sum, inout float compensation, float input) {
-    float y = input - compensation;
-    float t = sum + y;
-    compensation = (t - sum) - y;
-    sum = t;
+namespace BilateralFilter
+{
+    float CalculateWeight(
+        const float2 spatial_offset,
+        const float log2_center,
+        const float log2_neighbor,
+        const float inv_2_sigma_spatial_sq,
+        const float inv_2_sigma_range_sq
+    ) {
+        float weight_spatial = exp(-dot(spatial_offset, spatial_offset) * inv_2_sigma_spatial_sq);
+        float log_ratio_diff_sq = pow(log2_center - log2_neighbor, 2.0);
+        float weight_range = exp(-log_ratio_diff_sq * inv_2_sigma_range_sq);
+        return weight_spatial * weight_range;
+    }
 }
 
 // ==============================================================================
-// PHYSICALLY CORRECT Pixel Shader
+// Pixel Shader
 // ==============================================================================
 
 void PS_BilateralContrast(float4 vpos : SV_Position, float2 texcoord : TEXCOORD0, out float4 fragColor : SV_Target)
 {
-    int2 center_pos = int2(vpos.xy);
-    float3 color_encoded = tex2Dfetch(SamplerBackBuffer, center_pos).rgb;
-    float3 color_linear = DecodeToLinearBT2020(color_encoded);
+    // 1. Fetch and decode to a standard linear color space
+    const int2 center_pos = int2(vpos.xy);
+    const float3 color_encoded = tex2Dfetch(SamplerBackBuffer, center_pos).rgb;
+    const float3 color_linear = ColorScience::DecodeToLinear(color_encoded);
     
-    float luma_linear = max(GetLuminanceBT2020(color_linear), LUMA_EPSILON);
+    // 2. Convert to log2 perceptual space for processing
+    const float luma_linear = max(ColorScience::GetLuminance(color_linear), Constants::LUMA_EPSILON);
+    const float log2_ratio_center = ColorScience::LinearToLog2Ratio(luma_linear);
     
-    // CORRECTED: Convert to log2 ratio space
-    float log2_ratio_center = LinearToLog2Ratio(luma_linear);
-    
-    // Debug mode: visualize log2 ratios
-    if (bDebugMode) {
-        // Map -10 to +3 stops to 0-1 for visualization
-        float debug_value = saturate((log2_ratio_center + 10.0) / 13.0);
+    // 3. Handle Debug Visualization
+    if (bDebugMode)
+    {
+        const float debug_value = saturate((log2_ratio_center + 10.0) / 13.0);
         fragColor = float4(debug_value.xxx, 1.0);
         return;
     }
     
-    // Prepare filter parameters
-    float sigma_spatial_clamped = max(fSigmaSpatial, 0.01);
-    float sigma_range_clamped = max(fSigmaRange, 0.01);
-    float inv_2_sigma_spatial_sq = 0.5 / (sigma_spatial_clamped * sigma_spatial_clamped);
-    float inv_2_sigma_range_sq = 0.5 / (sigma_range_clamped * sigma_range_clamped);
+    // 4. Prepare filter parameters
+    const float sigma_spatial_clamped = max(fSigmaSpatial, 0.01);
+    const float sigma_range_clamped = max(fSigmaRange, 0.01);
+    const float inv_2_sigma_spatial_sq = 0.5 / (sigma_spatial_clamped * sigma_spatial_clamped);
+    const float inv_2_sigma_range_sq = 0.5 / (sigma_range_clamped * sigma_range_clamped);
     
-    // Kahan summation for numerical precision
     float sum_log2 = 0.0, compensation_log2 = 0.0;
     float sum_weight = 0.0, compensation_weight = 0.0;
     
-    // Bilateral filtering loop
+    // 5. Main Bilateral Filtering Loop
     [loop]
     for (int y = -iRadius; y <= iRadius; ++y)
     {
         [loop]
         for (int x = -iRadius; x <= iRadius; ++x)
         {
-            int2 sample_pos = center_pos + int2(x, y);
-            float2 spatial_offset = float2(x, y);
+            const float2 spatial_offset = float2(x, y);
+            const int2 sample_pos = center_pos + int2(x, y);
             
-            float3 neighbor_encoded = tex2Dfetch(SamplerBackBuffer, sample_pos).rgb;
-            float3 neighbor_linear = DecodeToLinearBT2020(neighbor_encoded);
+            const float3 neighbor_linear = ColorScience::DecodeToLinear(tex2Dfetch(SamplerBackBuffer, sample_pos).rgb);
+            const float neighbor_luma_linear = max(ColorScience::GetLuminance(neighbor_linear), Constants::LUMA_EPSILON);
+            const float log2_ratio_neighbor = ColorScience::LinearToLog2Ratio(neighbor_luma_linear);
             
-            float neighbor_luma_linear = max(GetLuminanceBT2020(neighbor_linear), LUMA_EPSILON);
-            
-            // CORRECTED: Work in log2 ratio space
-            float log2_ratio_neighbor = LinearToLog2Ratio(neighbor_luma_linear);
-            
-            // CORRECTED: Calculate weight with proper Gaussian range kernel
-            float weight = CalculateBilateralWeight(
-                spatial_offset,
-                log2_ratio_center,
-                log2_ratio_neighbor,
-                inv_2_sigma_spatial_sq,
-                inv_2_sigma_range_sq
+            const float weight = BilateralFilter::CalculateWeight(
+                spatial_offset, log2_ratio_center, log2_ratio_neighbor,
+                inv_2_sigma_spatial_sq, inv_2_sigma_range_sq
             );
             
-            // Accumulate with Kahan summation
-            KahanSum(sum_log2, compensation_log2, log2_ratio_neighbor * weight);
-            KahanSum(sum_weight, compensation_weight, weight);
+            FxUtils::KahanSum(sum_log2, compensation_log2, log2_ratio_neighbor * weight);
+            FxUtils::KahanSum(sum_weight, compensation_weight, weight);
         }
     }
     
     float3 enhanced_linear = color_linear;
     
-    // Process enhancement
-    if (sum_weight > WEIGHT_THRESHOLD)
+    // 6. Apply Contrast Enhancement
+    if (sum_weight > Constants::WEIGHT_THRESHOLD)
     {
-        float blurred_log2_ratio = sum_log2 / sum_weight;
+        const float blurred_log2_ratio = sum_log2 / sum_weight;
         float log2_diff = log2_ratio_center - blurred_log2_ratio;
         
-        // CORRECTED: Weber's Law compliant shadow protection
-        if (fDarkProtection > 0.001) {
-            // Protection threshold as absolute luminance
-            float protection_threshold = fDarkProtection * REFERENCE_WHITE_LINEAR;
-            
-            // Weber-Fechner Law: sensitivity proportional to luminance
-            // Gradually reduce enhancement below threshold
-            float protection_factor = saturate(
-                (luma_linear - protection_threshold) / 
-                max(luma_linear, LUMA_EPSILON)
-            );
-            
+        // --- CRITICAL FIX 1: Corrected Shadow Protection ---
+        // Instead of a hard cutoff, use smoothstep for a perception-aligned gentle fade of the effect in deep shadows.
+        if (fDarkProtection > 0.001)
+        {
+            const float protection_threshold = fDarkProtection * Constants::REFERENCE_WHITE_LINEAR;
+            const float protection_factor = smoothstep(0.0, protection_threshold, luma_linear);
             log2_diff *= protection_factor;
         }
         
-        // Apply enhancement in log2 space
-        float enhanced_log2_ratio = log2_ratio_center + fStrength * log2_diff;
+        const float enhanced_log2_ratio = log2_ratio_center + fStrength * log2_diff;
+        const float enhanced_luma_linear = ColorScience::Log2RatioToLinear(enhanced_log2_ratio);
         
-        // Convert back to linear
-        float enhanced_luma_linear = Log2RatioToLinear(enhanced_log2_ratio);
-        
-        // Calculate and apply ratio to preserve color
-        if (enhanced_luma_linear > LUMA_EPSILON && luma_linear > LUMA_EPSILON) {
-            float ratio = enhanced_luma_linear / luma_linear;
-            float safe_ratio = clamp(ratio, RATIO_MIN, RATIO_MAX);
-            enhanced_linear = color_linear * safe_ratio;
+        if (luma_linear > Constants::LUMA_EPSILON)
+        {
+            const float ratio = enhanced_luma_linear / luma_linear;
+            enhanced_linear = color_linear * clamp(ratio, Constants::RATIO_MIN, Constants::RATIO_MAX);
         }
     }
     
-    // Final validation and clamping
+    // 7. Final Validation and Encoding
     enhanced_linear = max(enhanced_linear, 0.0);
     
-    // NaN/Inf protection
-    if (any(isnan(enhanced_linear)) || any(isinf(enhanced_linear))) {
+    if (any(isnan(enhanced_linear)) || any(isinf(enhanced_linear)))
+    {
         enhanced_linear = color_linear;
     }
     
-    fragColor.rgb = EncodeFromLinearBT2020(enhanced_linear);
+    // --- CRITICAL FIX 2: Corrected HDR Clamping ---
+    // Preserve hue and saturation by scaling the color vector if its luminance exceeds the maximum,
+    // instead of using a component-wise clamp which distorts color.
+    const float enhanced_luma = ColorScience::GetLuminance(enhanced_linear);
+    if (enhanced_luma > Constants::MAX_LUMINANCE_LINEAR)
+    {
+        enhanced_linear *= (Constants::MAX_LUMINANCE_LINEAR / enhanced_luma);
+    }
+    
+    fragColor.rgb = ColorScience::EncodeFromLinear(enhanced_linear);
     fragColor.a = 1.0;
 }
 
@@ -340,15 +299,13 @@ void PS_BilateralContrast(float4 vpos : SV_Position, float2 texcoord : TEXCOORD0
 // ==============================================================================
 
 technique lilium__bilateral_contrast <
-    ui_label = "Lilium: PHYSICALLY CORRECT Bilateral Contrast";
-    ui_tooltip = "Academically rigorous implementation with:\n"
-                 "• Correct log2 luminance RATIO processing (not absolute values)\n"
-                 "• Proper Gaussian bilateral filtering (no threshold artifacts)\n"
-                 "• Weber's Law compliant shadow protection\n"
-                 "• Unified SDR/HDR processing with correct reference whites\n"
-                 "• Debug mode to visualize log2 ratio processing\n\n"
-                 "Sigma values represent exposure stop tolerances:\n"
-                 "0.5 = ±0.5 stops (1.41x ratio), 1.0 = ±1 stop (2x ratio)";
+    ui_label = "Lilium: Physically Correct Bilateral Contrast";
+    ui_tooltip = "Academically rigorous local contrast enhancement.\n"
+                 "Features:\n"
+                 " • Correct log2 luminance RATIO processing\n"
+                 " • Pure Gaussian bilateral filtering (no artifacts)\n"
+                 " • Corrected perception-aligned shadow protection\n"
+                 " • Unified SDR/HDR processing with color preservation";
 >
 {
     pass
