@@ -9,7 +9,7 @@
  * 5. Physically accurate color space conversions
  * 6. Color-preserving luminance clamping for HDR (Corrected)
  *
- * Version: 4.1 (Correctness and Code Cleanup Pass)
+ * Version: 4.2 (Correctness and Code Cleanup Pass)
  */
 
 #include "ReShade.fxh"
@@ -94,7 +94,6 @@ namespace Constants
 
     // Precision and stability constants
     static const float LUMA_EPSILON = 1e-8f;
-    static const float LOG2_MIN_RATIO = 1e-6f;
     static const float WEIGHT_THRESHOLD = 1e-7f;
     static const float RATIO_MIN = 0.001f;
     static const float RATIO_MAX = 1000.0f;
@@ -160,7 +159,6 @@ namespace ColorScience
     float LinearToLog2Ratio(const float linear_luma)
     {
         float ratio = linear_luma / Constants::REFERENCE_WHITE_LINEAR;
-        //ratio = max(ratio, Constants::LOG2_MIN_RATIO);  // leads to the "lifted" or "raised" blacks bug to delete
         return log2(ratio);
     }
 
