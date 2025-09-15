@@ -160,7 +160,7 @@ namespace ColorScience
     float LinearToLog2Ratio(const float linear_luma)
     {
         float ratio = linear_luma / Constants::REFERENCE_WHITE_LINEAR;
-        ratio = max(ratio, Constants::LOG2_MIN_RATIO);
+        //ratio = max(ratio, Constants::LOG2_MIN_RATIO);  // leads to the "lifted" or "raised" blacks bug to delete
         return log2(ratio);
     }
 
