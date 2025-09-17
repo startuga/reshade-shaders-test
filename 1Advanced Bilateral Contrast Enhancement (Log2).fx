@@ -9,7 +9,7 @@
  * 5. Physically accurate color space conversions
  * 6. Color-preserving luminance clamping for HDR (Corrected)
  *
- * Version: 4.2 (Correctness and Code Cleanup Pass)
+ * Version: 4.2.2 (Correctness and Code Cleanup Pass)
  */
 
 #include "ReShade.fxh"
@@ -79,22 +79,23 @@ uniform bool bDebugMode <
 namespace Constants
 {
     // Normalized reference white for the current color space's linear RGB representation
+    // Reference white in the LINEAR COLOR SPACE AFTER CONVERSION
     #if (ACTUAL_COLOUR_SPACE == CSP_SRGB)
-        static const float REFERENCE_WHITE_LINEAR = 1.0;  // SDR is normalized to 1.0
-    #elif (ACTUAL_COLOUR_SPACE == CSP_HDR10 || ACTUAL_COLOUR_SPACE == CSP_SCRGB)
-        static const float REFERENCE_WHITE_LINEAR = 125.0;  // 10,000 nits / 80 nits
+        static const float REFERENCE_WHITE_LINEAR = 1.0;   // 1.0 in linear RGB = 100 nits
+    #elif (ACTUAL_COLOUR_SPACE == CSP_SCRGB)
+        static const float REFERENCE_WHITE_LINEAR = 1.0;   // 1.0 in linear RGB = 80 nits
+    #elif (ACTUAL_COLOUR_SPACE == CSP_HDR10)
+        static const float REFERENCE_WHITE_LINEAR = 0.01;  // 0.01 in linear light = 100 nits (1.0 = 10,000 nits)
     #elif (ACTUAL_COLOUR_SPACE == CSP_HLG)
-        static const float REFERENCE_WHITE_LINEAR = 12.5;   // 1,000 nits / 80 nits
+        static const float REFERENCE_WHITE_LINEAR = 0.012; // 0.012 in linear light = 12 nits (1.0 = 1,000 nits)
     #else
         static const float REFERENCE_WHITE_LINEAR = 1.0;
     #endif
     
-    // Allow for one stop of headroom over the reference white
-    static const float MAX_LUMINANCE_LINEAR = REFERENCE_WHITE_LINEAR * 2.0;
 
     // Precision and stability constants
     static const float LUMA_EPSILON = 1e-8f;
-    static const float WEIGHT_THRESHOLD = 1e-7f;
+    static const float WEIGHT_THRESHOLD = 1e-8f;
     static const float RATIO_MIN = 0.001f;
     static const float RATIO_MAX = 1000.0f;
 }
@@ -130,12 +131,11 @@ namespace ColorScience
             color = Csp::Trc::HlgTo::Linear(color);
         #endif
         
-        return color * Constants::REFERENCE_WHITE_LINEAR;
+        return color;
     }
 
     float3 EncodeFromLinear(float3 color)
     {
-        color /= Constants::REFERENCE_WHITE_LINEAR;
         
         #if (ACTUAL_COLOUR_SPACE == CSP_SRGB)
             color = Csp::Mat::Bt2020To::Bt709(color);
@@ -156,9 +156,9 @@ namespace ColorScience
         return dot(linearBT2020, Csp::Mat::Bt2020ToXYZ[1]);
     }
 
-    float LinearToLog2Ratio(const float linear_luma)
+    float LinearToLog2Ratio(const float linear_luma_nits)
     {
-        float ratio = linear_luma / Constants::REFERENCE_WHITE_LINEAR;
+        float ratio = linear_luma_nits / Constants::REFERENCE_WHITE_LINEAR;
         return log2(ratio);
     }
 
