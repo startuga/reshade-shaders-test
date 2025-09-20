@@ -63,7 +63,7 @@ uniform float fDarkProtection <
                  "Value is a percentage of the reference white level.";
     ui_min = 0.0;
     ui_max = 0.2;
-    ui_step = 0.001;
+    ui_step = 0.000001;
 > = 0.0;
 
 uniform bool bDebugMode <
@@ -96,8 +96,8 @@ namespace Constants
     // Precision and stability constants
     static const float LUMA_EPSILON = 1e-8f;
     static const float WEIGHT_THRESHOLD = 1e-8f;
-    static const float RATIO_MIN = 0.001f;
-    static const float RATIO_MAX = 1000.0f;
+    static const float RATIO_MIN = 0.000001f;
+    static const float RATIO_MAX = 2.0000f;
 }
 
 namespace FxUtils
@@ -254,7 +254,7 @@ void PS_BilateralContrast(float4 vpos : SV_Position, float2 texcoord : TEXCOORD0
         
         // --- CRITICAL FIX 1: Corrected Shadow Protection ---
         // Instead of a hard cutoff, use smoothstep for a perception-aligned gentle fade of the effect in deep shadows.
-        if (fDarkProtection > 0.001)
+        if (fDarkProtection > 0.000001)
         {
             const float protection_threshold = fDarkProtection * Constants::REFERENCE_WHITE_LINEAR;
             const float protection_factor = smoothstep(0.0, protection_threshold, luma_linear);
@@ -291,10 +291,10 @@ technique lilium__bilateral_contrast <
     ui_label = "Lilium: Physically Correct Bilateral Contrast";
     ui_tooltip = "Academically rigorous local contrast enhancement.\n"
                  "Features:\n"
-                 " • Correct log2 luminance RATIO processing\n"
-                 " • Pure Gaussian bilateral filtering (no artifacts)\n"
-                 " • Corrected perception-aligned shadow protection\n"
-                 " • Unified SDR/HDR processing with color preservation";
+                 "Correct log2 luminance RATIO processing\n"
+                 "Pure Gaussian bilateral filtering (no artifacts)\n"
+                 "Corrected perception-aligned shadow protection\n"
+                 "Unified SDR/HDR processing with color preservation";
 >
 {
     pass
