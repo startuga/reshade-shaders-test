@@ -13,7 +13,7 @@
  */
 
 #include "ReShade.fxh"
-#include "lilium__include/colour_space.fxh"
+#include "lilium__include/colour_space.fxh"  // https://github.com/EndlesslyFlowering/ReShade_HDR_shaders/blob/master/Shaders/lilium__include/colour_space.fxh
 
 // ==============================================================================
 // UI Configuration
@@ -97,7 +97,8 @@ namespace Constants
     static const float LUMA_EPSILON = 1e-8f;
     static const float WEIGHT_THRESHOLD = 1e-8f;
     static const float RATIO_MIN = 0.000001f;
-    static const float RATIO_MAX = 2.0000f;
+    //static const float RATIO_MAX = 2.0000f;
+
 }
 
 namespace FxUtils
@@ -158,7 +159,7 @@ namespace ColorScience
 
     float LinearToLog2Ratio(const float linear_luma_nits)
     {
-        float ratio = linear_luma_nits / Constants::REFERENCE_WHITE_LINEAR;
+        float ratio = max(linear_luma_nits, Constants::LUMA_EPSILON) / Constants::REFERENCE_WHITE_LINEAR;
         return log2(ratio);
     }
 
@@ -228,7 +229,7 @@ void PS_BilateralContrast(float4 vpos : SV_Position, float2 texcoord : TEXCOORD0
         for (int x = -iRadius; x <= iRadius; ++x)
         {
             const float2 spatial_offset = float2(x, y);
-            const int2 sample_pos = center_pos + int2(x, y);
+            const int2 sample_pos = clamp(center_pos + int2(x, y), 0, int2(BUFFER_WIDTH - 1, BUFFER_HEIGHT - 1));
             
             const float3 neighbor_linear = ColorScience::DecodeToLinear(tex2Dfetch(SamplerBackBuffer, sample_pos).rgb);
             const float neighbor_luma_linear = max(ColorScience::GetLuminance(neighbor_linear), Constants::LUMA_EPSILON);
@@ -267,7 +268,8 @@ void PS_BilateralContrast(float4 vpos : SV_Position, float2 texcoord : TEXCOORD0
         if (luma_linear > Constants::LUMA_EPSILON)
         {
             const float ratio = enhanced_luma_linear / luma_linear;
-            enhanced_linear = color_linear * clamp(ratio, Constants::RATIO_MIN, Constants::RATIO_MAX);
+            float dynamic_ratio_max = (ACTUAL_COLOUR_SPACE >= CSP_HDR10) ? 10.0 : 2.0;
+			enhanced_linear = color_linear * clamp(ratio, Constants::RATIO_MIN, dynamic_ratio_max);
         }
     }
     
