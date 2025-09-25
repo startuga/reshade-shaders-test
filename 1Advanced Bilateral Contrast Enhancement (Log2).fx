@@ -10,6 +10,7 @@
  * 6. Color-preserving luminance clamping for HDR (Corrected)
  *
  * Version: 4.2.2 (Correctness and Code Cleanup Pass)
+ * Modification: Removed REFERENCE_WHITE_LINEAR for simplification; log2 ratios are now direct from linear luminance.
  */
 
 #include "ReShade.fxh"
@@ -58,12 +59,12 @@ uniform float fSigmaRange <
 
 uniform float fDarkProtection <
     ui_type = "slider";
-    ui_label = "Shadow Protection (% of Reference)";
-    ui_tooltip = "Threshold below which contrast is smoothly reduced, preventing black crush.\n"
-                 "Value is a percentage of the reference white level.";
+    ui_label = "Shadow Protection (Linear Threshold)";
+    ui_tooltip = "Linear luminance threshold below which contrast is smoothly reduced, preventing black crush.\n"
+                 "Higher values protect more shadow detail.";
     ui_min = 0.0;
     ui_max = 0.2;
-    ui_step = 0.000001;
+    ui_step = 0.001;
 > = 0.0;
 
 uniform bool bDebugMode <
@@ -78,24 +79,11 @@ uniform bool bDebugMode <
 
 namespace Constants
 {
-
-    #if (ACTUAL_COLOUR_SPACE == CSP_SRGB)
-    static const float REFERENCE_WHITE_LINEAR = 1.0;     // 1.0 = 80 nits (SDR)
-	#elif (ACTUAL_COLOUR_SPACE == CSP_SCRGB)
-    static const float REFERENCE_WHITE_LINEAR = 1.0;     // 1.0 = 80 nits
-	#elif (ACTUAL_COLOUR_SPACE == CSP_HDR10)
-    static const float REFERENCE_WHITE_LINEAR = 0.0125;  // 100 nits / 10,000 nits
-	#elif (ACTUAL_COLOUR_SPACE == CSP_HLG)
-    static const float REFERENCE_WHITE_LINEAR = 0.1;     // 100 nits / 1,000 nits
-    #endif
-    
-
     // Precision and stability constants
     static const float LUMA_EPSILON = 1e-8f;
     static const float WEIGHT_THRESHOLD = 1e-7f;
-    static const float RATIO_MIN = 0.000001f;
-    static const float RATIO_MAX = 100.0000f;
-
+    static const float RATIO_MAX = 8.0f; // exp2(3.0)
+    static const float RATIO_MIN = 0.25f; // exp2(-2.0)
 }
 
 namespace FxUtils
@@ -129,13 +117,11 @@ namespace ColorScience
             color = Csp::Trc::HlgTo::Linear(color);
         #endif
         
-        return color * Constants::REFERENCE_WHITE_LINEAR;
+        return color;
     }
 
     float3 EncodeFromLinear(float3 color)
-    {
-        color /= Constants::REFERENCE_WHITE_LINEAR;
-        
+    {        
         #if (ACTUAL_COLOUR_SPACE == CSP_SRGB)
             color = Csp::Mat::Bt2020To::Bt709(color);
             color = ENCODE_SDR(color);
@@ -157,13 +143,12 @@ namespace ColorScience
 
     float LinearToLog2Ratio(const float linear_luma)
     {
-        float ratio = linear_luma / Constants::REFERENCE_WHITE_LINEAR;
-        return log2(ratio);
+        return log2(max(linear_luma, Constants::LUMA_EPSILON));
     }
 
     float Log2RatioToLinear(const float log2_ratio)
     {
-        return Constants::REFERENCE_WHITE_LINEAR * exp2(log2_ratio);
+        return exp2(log2_ratio);
     }
 }
 
@@ -173,17 +158,17 @@ namespace ColorScience
 
 namespace BilateralFilter
 {
-    float CalculateWeight(
-        const float2 spatial_offset,
+    float CalculateWeight(const float2 spatial_offset,
         const float log2_center,
         const float log2_neighbor,
         const float inv_2_sigma_spatial_sq,
-        const float inv_2_sigma_range_sq
-    ) {
-        float weight_spatial = exp(-dot(spatial_offset, spatial_offset) * inv_2_sigma_spatial_sq);
-        float log_ratio_diff_sq = pow(log2_center - log2_neighbor, 2.0);
-        float weight_range = exp(-log_ratio_diff_sq * inv_2_sigma_range_sq);
-        return weight_spatial * weight_range;
+        const float inv_2_sigma_range_sq)
+    {
+        const float r2 = dot(spatial_offset, spatial_offset);
+        const float w_spatial = exp(-r2 * inv_2_sigma_spatial_sq);
+        const float d = log2_center - log2_neighbor;
+        const float w_range = exp(-(d * d) * inv_2_sigma_range_sq);
+        return w_spatial * w_range;
     }
 }
 
@@ -253,14 +238,11 @@ void PS_BilateralContrast(float4 vpos : SV_Position, float2 texcoord : TEXCOORD0
         
         // Instead of a hard cutoff, use smoothstep for a perception-aligned gentle fade of the effect in deep shadows.
         if (fDarkProtection > 1e-6)
-	{
-   	 // Convert protection to log space for consistent behavior
-   	 const float protection_log2 = log2(max(fDarkProtection, 0.001));
-    	const float protection_factor = smoothstep(protection_log2 - 2.0, 
-     	                                         protection_log2, 
-     	                                         log2_ratio_center);
-    	log2_diff *= protection_factor;
-	}
+        {
+            const float protection_log2 = ColorScience::LinearToLog2Ratio(fDarkProtection);
+            const float protection_factor = smoothstep(protection_log2 - 0.5, protection_log2 + 0.5, log2_ratio_center);
+            log2_diff *= protection_factor;
+        }
         
         const float enhanced_log2_ratio = log2_ratio_center + fStrength * log2_diff;
         const float enhanced_luma_linear = ColorScience::Log2RatioToLinear(enhanced_log2_ratio);
