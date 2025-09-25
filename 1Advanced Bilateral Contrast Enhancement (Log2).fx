@@ -2,15 +2,14 @@
  * PHYSICALLY CORRECT Bilateral Contrast Enhancement for ReShade
  *
  * This shader implements academically rigorous bilateral filtering with:
- * 1. Correct log2 luminance ratio processing (not absolute values)
+ * 1. Correct log2 luminance ratio processing
  * 2. Proper Gaussian range kernel without threshold artifacts
- * 3. Smoothed, perception-aligned shadow protection (Corrected)
- * 4. Unified SDR/HDR processing with correct reference whites
+ * 3. Smoothed, perception-aligned shadow protection
+ * 4. SDR/HDR processing
  * 5. Physically accurate color space conversions
- * 6. Color-preserving luminance clamping for HDR (Corrected)
+ * 6. Color-preserving luminance clamping for HDR
  *
- * Version: 4.2.2 (Correctness and Code Cleanup Pass)
- * Modification: Removed REFERENCE_WHITE_LINEAR for simplification; log2 ratios are now direct from linear luminance.
+ * Version: 4.2.3
  */
 
 #include "ReShade.fxh"
