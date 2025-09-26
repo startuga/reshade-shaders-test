@@ -9,7 +9,7 @@
  * 5. Physically accurate color space conversions
  * 6. Color-preserving luminance
  *
- * Version: 4.2.2
+ * Version: 4.2.3
  */
 
 #include "ReShade.fxh"
