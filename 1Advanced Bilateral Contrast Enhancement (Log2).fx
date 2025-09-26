@@ -130,7 +130,7 @@ namespace ColorScience
         #elif (ACTUAL_COLOUR_SPACE == CSP_SCRGB)
             return dot(linearBt, Csp::Mat::ScRgbToXYZ[1]);
         #elif (ACTUAL_COLOUR_SPACE == CSP_HDR10)
-            return dot(linearBt, FetchFromHdr10ToLinearLUT);
+            return dot(linearBt, Csp::Mat::Bt2020ToXYZ[1]);
         #endif
     }
 
