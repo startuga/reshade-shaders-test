@@ -2,14 +2,14 @@
  * PHYSICALLY CORRECT Bilateral Contrast Enhancement for ReShade
  *
  * This shader implements academically rigorous bilateral filtering with:
- * 1. Correct log2 luminance ratio processing
+ * 1. Correct log2 luminance ratio processing (not absolute values)
  * 2. Proper Gaussian range kernel without threshold artifacts
  * 3. Smoothed, perception-aligned shadow protection
  * 4. SDR/HDR processing
  * 5. Physically accurate color space conversions
- * 6. Color-preserving luminance clamping for HDR
+ * 6. Color-preserving luminance
  *
- * Version: 4.2.3
+ * Version: 4.2.2
  */
 
 #include "ReShade.fxh"
@@ -66,12 +66,6 @@ uniform float fDarkProtection <
     ui_step = 0.001;
 > = 0.0;
 
-uniform bool bDebugMode <
-    ui_label = "Debug: Show Log2 Luminance";
-    ui_tooltip = "Visualize the log2 luminance ratios being processed.\n"
-                 "Gray=0 stops, Black=-10 stops, White=+3 stops.";
-> = false;
-
 // ==============================================================================
 // Constants & Utilities
 // ==============================================================================
@@ -107,13 +101,10 @@ namespace ColorScience
     {
         #if (ACTUAL_COLOUR_SPACE == CSP_SRGB)
             color = DECODE_SDR(color);
-            color = Csp::Mat::Bt709To::Bt2020(color);
         #elif (ACTUAL_COLOUR_SPACE == CSP_SCRGB)
-            color = Csp::Mat::Bt709To::Bt2020(color);
+            color = Csp::Mat::ScRgbTo::Bt2020Normalised(color);
         #elif (ACTUAL_COLOUR_SPACE == CSP_HDR10)
-            color = Csp::Trc::PqTo::Linear(color);
-        #elif (ACTUAL_COLOUR_SPACE == CSP_HLG)
-            color = Csp::Trc::HlgTo::Linear(color);
+            color = FetchFromHdr10ToLinearLUT(color);
         #endif
         
         return color;
@@ -122,22 +113,25 @@ namespace ColorScience
     float3 EncodeFromLinear(float3 color)
     {        
         #if (ACTUAL_COLOUR_SPACE == CSP_SRGB)
-            color = Csp::Mat::Bt2020To::Bt709(color);
             color = ENCODE_SDR(color);
         #elif (ACTUAL_COLOUR_SPACE == CSP_SCRGB)
-            color = Csp::Mat::Bt2020To::Bt709(color);
+            color = Csp::Mat::Bt2020NormalisedTo::ScRgb(color);
         #elif (ACTUAL_COLOUR_SPACE == CSP_HDR10)
             color = Csp::Trc::LinearTo::Pq(color);
-        #elif (ACTUAL_COLOUR_SPACE == CSP_HLG)
-            color = Csp::Trc::LinearTo::Hlg(color);
         #endif
         
         return color;
     }
 
-    float GetLuminance(const float3 linearBT2020)
+    float GetLuminance(const float3 linearBt)
     {
-        return dot(linearBT2020, Csp::Mat::Bt2020ToXYZ[1]);
+        #if (ACTUAL_COLOUR_SPACE == CSP_SRGB)
+            return dot(linearBt, Csp::Mat::Bt709ToXYZ[1]);
+        #elif (ACTUAL_COLOUR_SPACE == CSP_SCRGB)
+            return dot(linearBt, Csp::Mat::ScRgbToXYZ[1]);
+        #elif (ACTUAL_COLOUR_SPACE == CSP_HDR10)
+            return dot(linearBt, FetchFromHdr10ToLinearLUT);
+        #endif
     }
 
     float LinearToLog2Ratio(const float linear_luma)
@@ -185,16 +179,8 @@ void PS_BilateralContrast(float4 vpos : SV_Position, float2 texcoord : TEXCOORD0
     // 2. Convert to log2 perceptual space for processing
     const float luma_linear = max(ColorScience::GetLuminance(color_linear), Constants::LUMA_EPSILON);
     const float log2_ratio_center = ColorScience::LinearToLog2Ratio(luma_linear);
-    
-    // 3. Handle Debug Visualization
-    if (bDebugMode)
-    {
-        const float debug_value = saturate((log2_ratio_center + 10.0) / 13.0);
-        fragColor = float4(debug_value.xxx, 1.0);
-        return;
-    }
-    
-    // 4. Prepare filter parameters
+        
+    // 3. Prepare filter parameters
     const float sigma_spatial_clamped = max(fSigmaSpatial, 0.01);
     const float sigma_range_clamped = max(fSigmaRange, 0.01);
     const float inv_2_sigma_spatial_sq = 0.5 / (sigma_spatial_clamped * sigma_spatial_clamped);
@@ -203,7 +189,7 @@ void PS_BilateralContrast(float4 vpos : SV_Position, float2 texcoord : TEXCOORD0
     float sum_log2 = 0.0, compensation_log2 = 0.0;
     float sum_weight = 0.0, compensation_weight = 0.0;
     
-    // 5. Main Bilateral Filtering Loop
+    // 4. Main Bilateral Filtering Loop
     [loop]
     for (int y = -iRadius; y <= iRadius; ++y)
     {
@@ -229,7 +215,7 @@ void PS_BilateralContrast(float4 vpos : SV_Position, float2 texcoord : TEXCOORD0
     
     float3 enhanced_linear = color_linear;
     
-    // 6. Apply Contrast Enhancement
+    // 5. Apply Contrast Enhancement
     if (sum_weight > Constants::WEIGHT_THRESHOLD)
     {
         const float blurred_log2_ratio = sum_log2 / sum_weight;
@@ -253,7 +239,7 @@ void PS_BilateralContrast(float4 vpos : SV_Position, float2 texcoord : TEXCOORD0
         }
     }
     
-    // 7. Final Validation and Encoding
+    // 6. Final Validation and Encoding
     enhanced_linear = max(enhanced_linear, 0.0);
     
     if (any(isnan(enhanced_linear)) || any(isinf(enhanced_linear)))
@@ -276,7 +262,7 @@ technique lilium__bilateral_contrast <
                  "Correct log2 luminance RATIO processing\n"
                  "Pure Gaussian bilateral filtering (no artifacts)\n"
                  "Corrected perception-aligned shadow protection\n"
-                 "Unified SDR/HDR processing with color preservation";
+                 "SDR/HDR processing with color preservation";
 >
 {
     pass
