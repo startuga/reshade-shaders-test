@@ -11,12 +11,12 @@
  * 7. Zero-overhead adaptive radius via hardware gradients
  * 8. Performance monitoring and debug modes
  *
- * Version: 5.0.3 STABLE
+ * Version: 5.0.2
  * 
  * Changelog:
  * 5.0.2 - Replaced gradient estimation with zero-cost hardware derivatives (ddx/ddy).
  *         Implemented true circular loop sampling to reduce total iterations by ~21.5%.
- * 5.0.1 - Branchless optimizations.
+ * 5.0.1 - Branchless optimizations and sqrt() removal.
  * 5.0.0 - Initial feature-rich implementation with variance-based adaptation.
  */
 
@@ -197,17 +197,11 @@ namespace Constants
     
     // Optimization constants
     static const float SPATIAL_CUTOFF_SIGMA = 3.0f; // Process within 3 sigma (99.7% of Gaussian)
-
-    // Adaptive radius tuning
-    static const float GRADIENT_SENSITIVITY = 100.0f;  // Scales gradient to usable range for smoothstep
-
-    // Hybrid mode variance weighting for adaptive strength
-    static const float VARIANCE_WEIGHT = 0.7f;  // Weights variance vs dynamic range in hybrid mode
 }
 
 namespace FxUtils
 {
-    // Kahan summation for improved numerical stability
+    // Extended Kahan summation for improved numerical stability
     void KahanSum(inout float sum, inout float compensation, const float input)
     {
         const float y = input - compensation;
@@ -247,7 +241,11 @@ namespace QualitySettings
             default: return fSigmaSpatial; // Custom
         }
     }
-
+    
+    bool UseOptimizations()
+    {
+        return iQualityPreset < 2 || bEnableSpatialCutoff; // Force optimizations for lower presets
+    }
 }
 
 // ==============================================================================
@@ -316,12 +314,10 @@ namespace BilateralFilter
         // Use hardware derivatives for a virtually zero-cost gradient approximation
         float gx = ddx(log2_luma);
         float gy = ddy(log2_luma);
-        float gradient_sq = gx * gx + gy * gy;
-
-        // Avoid sqrt by working in squared space
+        float gradient = sqrt(gx * gx + gy * gy);
+        
         // Reduce radius in flat areas, maintain in detailed areas
-        const float GRADIENT_SQ_THRESHOLD = 0.25; // = 0.5^2
-        const float radius_scale = smoothstep(0.0, GRADIENT_SQ_THRESHOLD, gradient_sq * Constants::GRADIENT_SENSITIVITY); // Why 100.0?
+        const float radius_scale = smoothstep(0.0, 0.5, gradient * 10.0);
         const float adaptive_factor = lerp(0.5, 1.0, radius_scale);
         return max(1, (int)(base_radius * adaptive_factor + 0.5));
     }
@@ -344,7 +340,7 @@ namespace BilateralFilter
                                               (Constants::MAX_DYNAMIC_RANGE - Constants::MIN_DYNAMIC_RANGE));
             const float variance_metric = saturate((local_variance - Constants::MIN_VARIANCE_SQ) / 
                                                   (Constants::MAX_VARIANCE_SQ - Constants::MIN_VARIANCE_SQ));
-            metric = max(range_metric, variance_metric * Constants::VARIANCE_WEIGHT);  // Why 0.7?
+            metric = max(range_metric, variance_metric * 0.7);
         }
         
         const float modulation = pow(metric, adaptive_curve);
@@ -393,7 +389,7 @@ void PS_BilateralContrast(float4 vpos : SV_Position, float2 texcoord : TEXCOORD0
     {
         effective_radius = BilateralFilter::GetAdaptiveRadius(log2_ratio_center, base_radius);
 
-        // Early return for adaptive radius visualization (before expensive filtering)
+        // Debug visualization for adaptive radius
         if (iDebugMode == 5)
         {
             float radius_norm = (float)effective_radius / (float)QualitySettings::GetRadius();
@@ -417,18 +413,17 @@ void PS_BilateralContrast(float4 vpos : SV_Position, float2 texcoord : TEXCOORD0
     float min_log2 = log2_ratio_center, max_log2 = log2_ratio_center;
     int pixels_processed = 0;
 
-    // OPTIMIZATION: True circular loop. Iterates ~21.46% fewer times than a square loop (theoretical maximum).
-    const int y_max = (int)cutoff_radius;
+    // OPTIMIZATION: True circular loop. Iterates ~21.5% fewer times than a square loop.
     [loop]
-    for (int y = -y_max; y <= y_max; ++y)
+    for (int y = -effective_radius; y <= effective_radius; ++y)
     {
         const float y_sq = (float)(y * y);
-
-        // Safety check for edge cases where y_sq ≈ cutoff_radius_sq due to rounding
-        if (y_sq > cutoff_radius_sq) continue;  // Now much rarer
+        
+        // Skip rows that are already outside the circular cutoff radius
+        if (y_sq > cutoff_radius_sq) continue;
         
         // Calculate the horizontal extent for this row to form a circle
-        const int x_max = (int)sqrt(max(0.0, cutoff_radius_sq - y_sq));
+        const int x_max = (int)sqrt(cutoff_radius_sq - y_sq);
         
         [loop]
         for (int x = -x_max; x <= x_max; ++x)
@@ -473,7 +468,7 @@ void PS_BilateralContrast(float4 vpos : SV_Position, float2 texcoord : TEXCOORD0
             const float mean_log2 = sum_log2 / sum_weight;
             const float mean_sq_log2 = sum_log2_sq / sum_weight;
             // Guard against floating point imprecision causing negative variance
-            const float local_variance = max(Constants::MIN_VARIANCE_SQ, mean_sq_log2 - mean_log2 * mean_log2);
+            const float local_variance = max(0.0, mean_sq_log2 - mean_log2 * mean_log2);
             
             effective_strength = BilateralFilter::CalculateAdaptiveStrength(
                 local_dynamic_range, local_variance, fStrength, 
@@ -492,9 +487,9 @@ void PS_BilateralContrast(float4 vpos : SV_Position, float2 texcoord : TEXCOORD0
         const float enhanced_luma_linear = ColorScience::Log2RatioToLinear(enhanced_log2_ratio);
         
         // Preserve color ratios
+        if (luma_linear > Constants::LUMA_EPSILON)
         {
-            const float inv_luma_linear = 1.0 / luma_linear;  // Already guaranteed > LUMA_EPSILON earlier
-            const float ratio = enhanced_luma_linear * inv_luma_linear;
+            const float ratio = enhanced_luma_linear / luma_linear;
             enhanced_linear = color_linear * clamp(ratio, Constants::RATIO_MIN, Constants::RATIO_MAX);
         }
         
