@@ -10,14 +10,47 @@
  * 6. True circular loop sampling for optimal iteration count
  * 7. Zero-overhead adaptive radius via hardware gradients
  * 8. Performance monitoring and debug modes
+ * 9. Content-aware tuning controls for different source material
  *
- * Version: 5.0.3 STABLE
+ * Version: 5.0.4
  * 
  * Changelog:
+ * 5.0.4 - Fixed adaptive strength hybrid mode to use weighted average for smooth transitions.
+ *         Added advanced exposed controls for content-specific tuning.
+ *         Added comprehensive content-type tuning documentation.
+ * 5.0.3 - Code quality improvements and constant organization.
  * 5.0.2 - Replaced gradient estimation with zero-cost hardware derivatives (ddx/ddy).
- *         Implemented true circular loop sampling to reduce total iterations by ~21.5%.
+ *         Implemented true circular loop sampling to reduce total iterations by ~21.46%.
  * 5.0.1 - Branchless optimizations.
  * 5.0.0 - Initial feature-rich implementation with variance-based adaptation.
+ * 
+ * CONTENT-SPECIFIC TUNING GUIDE
+ * ==============================
+ * 
+ * For optimal results, adjust advanced tuning parameters based on content type:
+ * 
+ * HIGH-FREQUENCY CONTENT (Hair, Foliage, Fabric, Fine Textures):
+ *   - Gradient Sensitivity: 50-75 (maintains larger radii in detailed areas)
+ *   - Variance Weight: 0.7 (keep default)
+ *   - Effect: More natural enhancement of fine structures without over-sharpening
+ * 
+ * NOISY INPUT (Low-Light, High-ISO, Compressed Video, Film Grain):
+ *   - Gradient Sensitivity: 100 (keep default)
+ *   - Variance Weight: 0.8-0.9 (conservative, resists noise amplification)
+ *   - Adaptive Curve: 2.0-2.5 (reduces sensitivity to noise-inflated variance)
+ *   - Effect: Cleaner results without enhancing noise artifacts
+ * 
+ * CLEAN CGI (Renders, Vector Graphics, Game Screenshots):
+ *   - Gradient Sensitivity: 100 (keep default)
+ *   - Variance Weight: 0.5-0.6 (balanced toward dynamic range)
+ *   - Adaptive Curve: 1.0-1.3 (more aggressive, no noise concerns)
+ *   - Effect: Better detection of both geometric and textural detail
+ * 
+ * SMOOTH CONTENT (Portraits, Skies, Gradients, Soft Lighting):
+ *   - Gradient Sensitivity: 125-150 (aggressive radius reduction in flat areas)
+ *   - Variance Weight: 0.7 (keep default)
+ *   - Range Sigma: 0.4-0.5 (softer edge preservation)
+ *   - Effect: Gentler enhancement that preserves smooth transitions
  */
 
 #include "ReShade.fxh"
@@ -84,7 +117,8 @@ uniform float fAdaptiveCurve <
     ui_label = "Adaptive Response Curve";
     ui_tooltip = "Controls how image statistics map to strength modulation.\n"
                  "Lower values = More aggressive adaptation\n"
-                 "Higher values = More conservative adaptation";
+                 "Higher values = More conservative adaptation\n\n"
+                 "Recommended: 1.5 (general), 2.0-2.5 (noisy), 1.0-1.3 (clean CGI)";
     ui_min = 0.5;
     ui_max = 3.0;
     ui_step = 0.01;
@@ -120,7 +154,8 @@ uniform float fSigmaRange <
                  "0.3 = Sharp edges (preserves 1.2x luminance ratios)\n"
                  "0.5 = Moderate (preserves 1.4x luminance ratios)\n"
                  "1.0 = Soft edges (preserves 2.0x luminance ratios)\n"
-                 "2.0 = Very soft (preserves 4.0x luminance ratios)";
+                 "2.0 = Very soft (preserves 4.0x luminance ratios)\n\n"
+                 "Recommended: 0.3 (general), 0.4-0.5 (smooth content)";
     ui_min = 0.1;
     ui_max = 3.0;
     ui_step = 0.01;
@@ -163,6 +198,41 @@ uniform float fHighlightProtection <
     ui_category = "Tone Protection";
 > = 0.0;
 
+uniform float fGradientSensitivity <
+    ui_type = "slider";
+    ui_label = "Gradient Sensitivity";
+    ui_tooltip = "Controls adaptive radius response to image gradients.\n"
+                 "Lower = Maintains larger radii in detailed areas\n"
+                 "Higher = More aggressive radius reduction\n\n"
+                 "CONTENT-SPECIFIC RECOMMENDATIONS:\n"
+                 "• High-frequency (hair, foliage, textures): 50-75\n"
+                 "• General content (default): 100\n"
+                 "• Smooth content (portraits, skies): 125-150\n\n"
+                 "Only applies when Adaptive Radius is enabled.";
+    ui_min = 25.0;
+    ui_max = 200.0;
+    ui_step = 5.0;
+    ui_category = "Advanced Tuning";
+> = 100.0;
+
+uniform float fVarianceWeight <
+    ui_type = "slider";
+    ui_label = "Variance Weight (Hybrid Mode)";
+    ui_tooltip = "Balances variance vs dynamic range in Hybrid adaptive mode.\n"
+                 "Higher = Prioritizes variance (texture complexity)\n"
+                 "Lower = Prioritizes dynamic range (contrast extremes)\n\n"
+                 "CONTENT-SPECIFIC RECOMMENDATIONS:\n"
+                 "• Noisy input (low-light, high-ISO): 0.80-0.90\n"
+                 "• General content (default): 0.70\n"
+                 "• Clean CGI/renders: 0.50-0.60\n\n"
+                 "Only applies when Adaptive Mode is set to Hybrid.\n"
+                 "Total weight with Dynamic Range should sum to 1.0.";
+    ui_min = 0.0;
+    ui_max = 1.0;
+    ui_step = 0.05;
+    ui_category = "Advanced Tuning";
+> = 0.70;
+
 uniform int iDebugMode <
     ui_type = "combo";
     ui_label = "Debug Visualization";
@@ -193,16 +263,10 @@ namespace Constants
     static const float MIN_DYNAMIC_RANGE = 0.05f;  // Minimum dynamic range in stops
     static const float MAX_DYNAMIC_RANGE = 10.0f;  // Maximum expected dynamic range in stops
     static const float MIN_VARIANCE_SQ = 0.001f * 0.001f;      // Minimum variance threshold
-    static const float MAX_VARIANCE_SQ = 2.0f * 2.0f;        // Maximum expected variance in log2 space
+    static const float MAX_VARIANCE_SQ = 2.0f * 2.0f;          // Maximum expected variance in log2 space
     
     // Optimization constants
     static const float SPATIAL_CUTOFF_SIGMA = 3.0f; // Process within 3 sigma (99.7% of Gaussian)
-
-    // Adaptive radius tuning
-    static const float GRADIENT_SENSITIVITY = 100.0f;  // Scales gradient to usable range for smoothstep
-
-    // Hybrid mode variance weighting for adaptive strength
-    static const float VARIANCE_WEIGHT = 0.7f;  // Weights variance vs dynamic range in hybrid mode
 }
 
 namespace FxUtils
@@ -215,7 +279,6 @@ namespace FxUtils
         compensation = (t - sum) - y;
         sum = t;
     }
-    
 }
 
 // ==============================================================================
@@ -247,7 +310,6 @@ namespace QualitySettings
             default: return fSigmaSpatial; // Custom
         }
     }
-
 }
 
 // ==============================================================================
@@ -321,12 +383,12 @@ namespace BilateralFilter
         // Avoid sqrt by working in squared space
         // Reduce radius in flat areas, maintain in detailed areas
         const float GRADIENT_SQ_THRESHOLD = 0.25; // = 0.5^2
-        const float radius_scale = smoothstep(0.0, GRADIENT_SQ_THRESHOLD, gradient_sq * Constants::GRADIENT_SENSITIVITY); // Why 100.0?
+        const float radius_scale = smoothstep(0.0, GRADIENT_SQ_THRESHOLD, gradient_sq * fGradientSensitivity);
         const float adaptive_factor = lerp(0.5, 1.0, radius_scale);
         return max(1, (int)(base_radius * adaptive_factor + 0.5));
     }
     
-    // Works in squared space to avoid using sqrt()
+    // Calculate adaptive strength using weighted average for smooth transitions
     float CalculateAdaptiveStrength(
         const float local_dynamic_range, const float local_variance,
         const float base_strength, const float adaptive_amount,
@@ -334,17 +396,23 @@ namespace BilateralFilter
     {
         float metric;
         if (mode == 0) {
+            // Dynamic Range only
             metric = saturate((local_dynamic_range - Constants::MIN_DYNAMIC_RANGE) / 
                             (Constants::MAX_DYNAMIC_RANGE - Constants::MIN_DYNAMIC_RANGE));
         } else if (mode == 1) {
+            // Variance only
             metric = saturate((local_variance - Constants::MIN_VARIANCE_SQ) / 
                             (Constants::MAX_VARIANCE_SQ - Constants::MIN_VARIANCE_SQ));
         } else {
+            // Hybrid: Weighted average for smooth, stable combination
             const float range_metric = saturate((local_dynamic_range - Constants::MIN_DYNAMIC_RANGE) / 
                                               (Constants::MAX_DYNAMIC_RANGE - Constants::MIN_DYNAMIC_RANGE));
             const float variance_metric = saturate((local_variance - Constants::MIN_VARIANCE_SQ) / 
                                                   (Constants::MAX_VARIANCE_SQ - Constants::MIN_VARIANCE_SQ));
-            metric = max(range_metric, variance_metric * Constants::VARIANCE_WEIGHT);  // Why 0.7?
+            
+            // Use weighted average instead of max() for smooth transitions
+            const float range_weight = 1.0 - fVarianceWeight;
+            metric = variance_metric * fVarianceWeight + range_metric * range_weight;
         }
         
         const float modulation = pow(metric, adaptive_curve);
@@ -423,9 +491,9 @@ void PS_BilateralContrast(float4 vpos : SV_Position, float2 texcoord : TEXCOORD0
     for (int y = -y_max; y <= y_max; ++y)
     {
         const float y_sq = (float)(y * y);
-
+        
         // Safety check for edge cases where y_sq ≈ cutoff_radius_sq due to rounding
-        if (y_sq > cutoff_radius_sq) continue;  // Now much rarer
+        if (y_sq > cutoff_radius_sq) continue;
         
         // Calculate the horizontal extent for this row to form a circle
         const int x_max = (int)sqrt(max(0.0, cutoff_radius_sq - y_sq));
@@ -541,7 +609,7 @@ void PS_BilateralContrast(float4 vpos : SV_Position, float2 texcoord : TEXCOORD0
         }
     }
     
-    // 8. Final validation and encoding
+    // Final validation and encoding
     enhanced_linear = max(enhanced_linear, 0.0);
     
     // NaN/Inf check
@@ -579,20 +647,21 @@ void PS_BilateralContrast(float4 vpos : SV_Position, float2 texcoord : TEXCOORD0
 // ==============================================================================
 
 technique lilium__bilateral_contrast <
-    ui_label = "Lilium: Physically Correct Bilateral Contrast v5.0";
-    ui_tooltip = "Academically rigorous local contrast enhancement with optimizations.\n\n"
-                 "New in v5.0:\n"
-                 "• Variance-based adaptive strength for better texture detection\n"
-                 "• Early spatial cutoff for 30%+ performance improvement\n"
-                 "• Content-adaptive radius adjustment\n"
-                 "• Highlight protection\n"
-                 "• Quality presets for easy configuration\n"
-                 "• Debug visualizations and performance monitoring\n\n"
+    ui_label = "Lilium: Physically Correct Bilateral Contrast v5.0.4";
+    ui_tooltip = "Academically rigorous local contrast enhancement with content-aware tuning.\n\n"
+                 "New in v5.0.4:\n"
+                 "• Fixed hybrid mode to use weighted average for smooth transitions\n"
+                 "• Added Gradient Sensitivity control for high-frequency content\n"
+                 "• Added Variance Weight control for noise-resistant adaptation\n"
+                 "• Comprehensive content-type tuning documentation\n\n"
                  "Features:\n"
                  "• Correct log2 luminance ratio processing\n"
                  "• Pure Gaussian bilateral filtering\n"
+                 "• Variance-based adaptive strength\n"
+                 "• Content-aware optimization controls\n"
                  "• SDR/HDR support with proper color preservation\n"
-                 "• Numerical stability through Kahan summation";
+                 "• Numerical stability through Kahan summation\n\n"
+                 "See shader header for content-specific tuning guide.";
 >
 {
     pass
