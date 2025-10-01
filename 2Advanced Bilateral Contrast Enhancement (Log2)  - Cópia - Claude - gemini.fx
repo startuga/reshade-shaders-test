@@ -325,7 +325,7 @@ namespace ColorScience
         #elif (ACTUAL_COLOUR_SPACE == CSP_SCRGB)
             color = Csp::Mat::ScRgbTo::Bt2020Normalised(color);
         #elif (ACTUAL_COLOUR_SPACE == CSP_HDR10)
-            color = FetchFromHdr10ToLinearLUT(color);
+            color = Csp::Trc::PqTo::Linear(color);
         #endif
         
         return color;
