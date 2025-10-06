@@ -480,7 +480,8 @@ void PS_BilateralContrast(float4 vpos : SV_Position, float2 texcoord : TEXCOORD0
         if (iDebugMode == 5)
         {
             float radius_norm = (float)effective_radius / (float)QualitySettings::GetRadius();
-            fragColor.rgb = lerp(float3(0, 0, 1), float3(1, 0, 0), radius_norm);
+            float3 debug_color = lerp(float3(0, 0, 1), float3(1, 0, 0), radius_norm);
+            fragColor.rgb = ColorScience::EncodeFromLinear(debug_color);
             fragColor.a = 1.0;
             return;
         }
