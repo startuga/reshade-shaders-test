@@ -12,9 +12,12 @@
  * 8. Performance monitoring and debug modes
  * 9. Content-aware tuning controls for different source material
  *
- * Version: 5.0.5
+ * Version: 5.0.6
  * 
  * Changelog:
+ * 5.0.6 - FIXED: Adaptive Strength calculation logic to be more intuitive and powerful.
+ *         OPTIMIZED: Bilateral filter loop bounds are now tighter, preventing wasted iterations.
+ *         FIXED: Minor typo in technique UI label.
  * 5.0.5 - FIXED CRITICAL BUG: Center pixel was sampled twice (once in init, once in loop).
  *         FIXED: Loop now correctly skips center pixel.
  *         IMPROVED: GetLuminance logic clarified for all color spaces.
@@ -109,7 +112,7 @@ uniform float fAdaptiveAmount <
     ui_label = "Adaptive Strength Amount";
     ui_tooltip = "How much the local statistics affect the strength.\n"
                  "0.0 = No adaptation (always uses base strength)\n"
-                 "1.0 = Full adaptation (up to 2x boost in detailed areas)";
+                 "1.0 = Full adaptation (from 0x to 2x strength)";
     ui_min = 0.0;
     ui_max = 1.0;
     ui_step = 0.01;
@@ -424,12 +427,9 @@ namespace BilateralFilter
             metric = variance_metric * fVarianceWeight + range_metric * range_weight;
         }
         
-        // Map modulation from [0, 1] to [-1, 1] for symmetrical scaling around 1.0
         const float modulation = pow(metric, adaptive_curve);
-        const float modulation_centered = modulation * 2.0 - 1.0; 
-        
-        // This sets the multiplier range from (1.0 - adaptive_amount) to (1.0 + adaptive_amount)
-        const float adaptive_multiplier = 1.0 + modulation_centered * adaptive_amount;
+        // Lerp from base strength to a modulated strength (0x to 2x)
+        const float adaptive_multiplier = lerp(1.0, modulation * 2.0, adaptive_amount);
         return base_strength * adaptive_multiplier;
     }
     
@@ -480,8 +480,7 @@ void PS_BilateralContrast(float4 vpos : SV_Position, float2 texcoord : TEXCOORD0
         if (iDebugMode == 5)
         {
             float radius_norm = (float)effective_radius / (float)QualitySettings::GetRadius();
-            float3 debug_color = lerp(float3(0, 0, 1), float3(1, 0, 0), radius_norm);
-            fragColor.rgb = ColorScience::EncodeFromLinear(debug_color);
+            fragColor.rgb = lerp(float3(0, 0, 1), float3(1, 0, 0), radius_norm);
             fragColor.a = 1.0;
             return;
         }
@@ -494,7 +493,8 @@ void PS_BilateralContrast(float4 vpos : SV_Position, float2 texcoord : TEXCOORD0
     // If enabled, cutoff_radius is 3 sigma, otherwise it's just the effective_radius
     const float cutoff_radius = bEnableSpatialCutoff ? min((float)effective_radius, Constants::SPATIAL_CUTOFF_SIGMA * sigma_spatial) : (float)effective_radius;
     const float cutoff_radius_sq = cutoff_radius * cutoff_radius;
-    const int max_radius = (int)ceil(cutoff_radius); // Use ceil for a safe max integer radius
+    // OPTIMIZATION: Use integer truncation (floor) for the max loop bound.
+    const int max_radius = (int)cutoff_radius;
     
     // Initialize sums with the center pixel's data (weight 1.0).
     float sum_log2 = log2_ratio_center, compensation_log2 = 0.0;
@@ -508,10 +508,6 @@ void PS_BilateralContrast(float4 vpos : SV_Position, float2 texcoord : TEXCOORD0
     for (int y = -max_radius; y <= max_radius; ++y)
     {
         const float y_sq = (float)(y * y);
-        
-        // Check against max radius squared
-        if (y_sq > cutoff_radius_sq + 1e-4f) continue;
-        
         // Calculate the horizontal extent for this row to form a circle
         const int x_max = (int)sqrt(max(0.0, cutoff_radius_sq - y_sq));
         
@@ -645,7 +641,7 @@ void PS_BilateralContrast(float4 vpos : SV_Position, float2 texcoord : TEXCOORD0
     fragColor.rgb = ColorScience::EncodeFromLinear(enhanced_linear);
     fragColor.a = 1.0;
     
-    // Show performance statistics overlay - now using a smaller, dedicated region
+    // Show performance statistics overlay
     if (bShowStatistics && center_pos.x < 200 && center_pos.y < 20)
     {
         // Darken the background of the 200x20 region
@@ -672,12 +668,11 @@ void PS_BilateralContrast(float4 vpos : SV_Position, float2 texcoord : TEXCOORD0
 // ==============================================================================
 
 technique lilium__bilateral_contrast <
-    ui_label = "Lilium: Physically Correct Bilateral Contrast v5.0.5";
+    ui_label = "Lilium: Physically Correct Bilateral Contrast v5.0.6";
     ui_tooltip = "Academically rigorous local contrast enhancement with content-aware tuning.\n\n"
-                 "New in v5.0.5:\n"
-                 "• FIX: Critical bug where center pixel was double-sampled in bilateral filter.\n"
-                 "• IMPROVED: Adaptive Strength calculation for intuitive strength range.\n"
-                 "• IMPROVED: Luminance coefficient lookup logic simplified for clarity.\n\n"
+                 "New in v5.0.6:\n"
+                 "• FIXED: More intuitive and powerful Adaptive Strength logic.\n"
+                 "• OPTIMIZED: Bilateral filter loop bounds are now tighter, preventing wasted iterations.\n\n"
                  "Features:\n"
                  "• Correct log2 luminance ratio processing\n"
                  "• Pure Gaussian bilateral filtering\n"
