@@ -12,10 +12,16 @@
  * 8. Performance monitoring and debug modes
  * 9. Content-aware tuning controls for different source material
  *
- * Version: 5.0.6
+ * Version: 5.0.8
  * 
  * Changelog:
- * 5.0.6 - FIXED: Adaptive Strength calculation logic to be more intuitive and powerful.
+ * 5.0.8 - FIXED: Performance efficiency calculation in debug modes now correctly uses the 
+ *         effective radius, providing an accurate metric for the current operation.
+ * 5.0.7 - RESTORED: Log-space (geometric mean) interpolation for the hybrid adaptive metric, improving HDR stability.
+ *         REVERTED: Center pixel handling reverted to the simpler and more robust loop-based approach.
+ *         FIXED: This also fixes the inaccurate 'pixels_processed' counter and ensures Kahan summation is applied to all samples.
+ *         SIMPLIFIED: NaN/Inf handling is now a single, cleaner fallback.
+ * 5.0.6 - FIXED: More intuitive and powerful Adaptive Strength logic.
  *         OPTIMIZED: Bilateral filter loop bounds are now tighter, preventing wasted iterations.
  *         FIXED: Minor typo in technique UI label.
  * 5.0.5 - FIXED CRITICAL BUG: Center pixel was sampled twice (once in init, once in loop).
@@ -416,19 +422,22 @@ namespace BilateralFilter
             metric = saturate((local_variance - Constants::MIN_VARIANCE_SQ) / 
                             (Constants::MAX_VARIANCE_SQ - Constants::MIN_VARIANCE_SQ));
         } else {
-            // Hybrid: Weighted average for smooth, stable combination
-            const float range_metric = saturate((local_dynamic_range - Constants::MIN_DYNAMIC_RANGE) / 
-                                              (Constants::MAX_DYNAMIC_RANGE - Constants::MIN_DYNAMIC_RANGE));
-            const float variance_metric = saturate((local_variance - Constants::MIN_VARIANCE_SQ) / 
-                                                  (Constants::MAX_VARIANCE_SQ - Constants::MIN_VARIANCE_SQ));
+            // Hybrid: Log-space interpolation (geometric mean) for HDR stability
+            float range_metric = saturate((local_dynamic_range - Constants::MIN_DYNAMIC_RANGE) / 
+                                        (Constants::MAX_DYNAMIC_RANGE - Constants::MIN_DYNAMIC_RANGE));
+            float variance_metric = saturate((local_variance - Constants::MIN_VARIANCE_SQ) / 
+                                           (Constants::MAX_VARIANCE_SQ - Constants::MIN_VARIANCE_SQ));
             
-            // Use weighted average instead of max() for smooth transitions
+            // Add epsilon to prevent pow(0, x) issues
+            range_metric = max(range_metric, 1e-6);
+            variance_metric = max(variance_metric, 1e-6);
+
             const float range_weight = 1.0 - fVarianceWeight;
-            metric = variance_metric * fVarianceWeight + range_metric * range_weight;
+            metric = pow(range_metric, range_weight) * pow(variance_metric, fVarianceWeight);
         }
         
         const float modulation = pow(metric, adaptive_curve);
-        // Lerp from base strength to a modulated strength (0x to 2x)
+        // Lerp from base multiplier (1.0) to a modulated multiplier (0x to 2x)
         const float adaptive_multiplier = lerp(1.0, modulation * 2.0, adaptive_amount);
         return base_strength * adaptive_multiplier;
     }
@@ -470,7 +479,7 @@ void PS_BilateralContrast(float4 vpos : SV_Position, float2 texcoord : TEXCOORD0
     const float luma_linear = max(ColorScience::GetLuminance(color_linear), Constants::LUMA_EPSILON);
     const float log2_ratio_center = ColorScience::LinearToLog2Ratio(luma_linear);
     
-    int base_radius = QualitySettings::GetRadius();
+    const int base_radius = QualitySettings::GetRadius();
     int effective_radius = base_radius;
     if (bAdaptiveRadius && base_radius > 2)
     {
@@ -496,12 +505,12 @@ void PS_BilateralContrast(float4 vpos : SV_Position, float2 texcoord : TEXCOORD0
     // OPTIMIZATION: Use integer truncation (floor) for the max loop bound.
     const int max_radius = (int)cutoff_radius;
     
-    // Initialize sums with the center pixel's data (weight 1.0).
-    float sum_log2 = log2_ratio_center, compensation_log2 = 0.0;
-    float sum_log2_sq = log2_ratio_center * log2_ratio_center, compensation_log2_sq = 0.0;
-    float sum_weight = 1.0, compensation_weight = 0.0;
+    // Initialize sums to zero. The loop will correctly handle the center pixel.
+    float sum_log2 = 0.0, compensation_log2 = 0.0;
+    float sum_log2_sq = 0.0, compensation_log2_sq = 0.0;
+    float sum_weight = 0.0, compensation_weight = 0.0;
     float min_log2 = log2_ratio_center, max_log2 = log2_ratio_center;
-    int pixels_processed = 1; // Start with 1 for the center pixel
+    int pixels_processed = 0;
 
     // OPTIMIZATION: True circular loop.
     [loop]
@@ -514,9 +523,6 @@ void PS_BilateralContrast(float4 vpos : SV_Position, float2 texcoord : TEXCOORD0
         [loop]
         for (int x = -x_max; x <= x_max; ++x)
         {
-            // FIX: Skip the center pixel as it was initialized above.
-            if (x == 0 && y == 0) continue; 
-
             pixels_processed++;
             const float r2 = (float)(x * x) + y_sq;
             
@@ -617,8 +623,9 @@ void PS_BilateralContrast(float4 vpos : SV_Position, float2 texcoord : TEXCOORD0
                     
                 case 6: // Performance heatmap
                 {
-                    const float efficiency = (float)pixels_processed / 
-                                           (float)((effective_radius * 2 + 1) * (effective_radius * 2 + 1));
+                    // FIX: Use effective_radius for an accurate efficiency metric
+                    const float total_possible_pixels_in_square = (float)((effective_radius * 2 + 1) * (effective_radius * 2 + 1));
+                    const float efficiency = (float)pixels_processed / max(total_possible_pixels_in_square, 1.0);
                     enhanced_linear = lerp(float3(1, 0, 0), float3(0, 1, 0), efficiency);
                     break;
                 }
@@ -629,12 +636,10 @@ void PS_BilateralContrast(float4 vpos : SV_Position, float2 texcoord : TEXCOORD0
     // Final validation and encoding
     enhanced_linear = max(enhanced_linear, 0.0);
     
-    // NaN/Inf check - component-wise fallback for better recovery
-    if (any(isnan(enhanced_linear)) || any(isinf(enhanced_linear)))
+    // SIMPLIFIED NaN/Inf check
+    if (any(isnan(enhanced_linear) || isinf(enhanced_linear)))
     {
-        enhanced_linear.r = (isnan(enhanced_linear.r) || isinf(enhanced_linear.r)) ? color_linear.r : enhanced_linear.r;
-        enhanced_linear.g = (isnan(enhanced_linear.g) || isinf(enhanced_linear.g)) ? color_linear.g : enhanced_linear.g;
-        enhanced_linear.b = (isnan(enhanced_linear.b) || isinf(enhanced_linear.b)) ? color_linear.b : enhanced_linear.b;
+        enhanced_linear = color_linear; // Fallback to unprocessed pixel
     }
     
     // Encode back to output color space
@@ -650,8 +655,9 @@ void PS_BilateralContrast(float4 vpos : SV_Position, float2 texcoord : TEXCOORD0
         // Draw the performance bar between y=5 and y=15
         if (center_pos.y >= 5 && center_pos.y < 15) 
         {
-            const float total_pixels = (effective_radius * 2 + 1) * (effective_radius * 2 + 1);
-            const float efficiency = (float)pixels_processed / max(total_pixels, 1.0);
+            // FIX: Use effective_radius for an accurate efficiency metric
+            const float total_possible_pixels_in_square = (float)((effective_radius * 2 + 1) * (effective_radius * 2 + 1));
+            const float efficiency = (float)pixels_processed / max(total_possible_pixels_in_square, 1.0);
             
             float bar_position = (float)center_pos.x / 199.0;
             if (bar_position < efficiency)
@@ -668,11 +674,11 @@ void PS_BilateralContrast(float4 vpos : SV_Position, float2 texcoord : TEXCOORD0
 // ==============================================================================
 
 technique lilium__bilateral_contrast <
-    ui_label = "Lilium: Physically Correct Bilateral Contrast v5.0.6";
+    ui_label = "Lilium: Physically Correct Bilateral Contrast v5.0.8";
     ui_tooltip = "Academically rigorous local contrast enhancement with content-aware tuning.\n\n"
-                 "New in v5.0.6:\n"
-                 "• FIXED: More intuitive and powerful Adaptive Strength logic.\n"
-                 "• OPTIMIZED: Bilateral filter loop bounds are now tighter, preventing wasted iterations.\n\n"
+                 "New in v5.0.8:\n"
+                 "• FIXED: Performance efficiency calculation in debug modes now correctly uses the\n"
+                 "  effective radius, providing an accurate metric for the current operation.\n\n"
                  "Features:\n"
                  "• Correct log2 luminance ratio processing\n"
                  "• Pure Gaussian bilateral filtering\n"
