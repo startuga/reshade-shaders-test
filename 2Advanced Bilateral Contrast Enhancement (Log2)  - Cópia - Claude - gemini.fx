@@ -305,9 +305,9 @@ namespace QualitySettings
         switch(iQualityPreset)
         {
             case 0: return 3;  // Performance
-            case 1: return 5;  // Balanced
-            case 2: return 7;  // Quality
-            case 3: return 10; // Ultra
+            case 1: return 4;  // Balanced
+            case 2: return 6;  // Quality
+            case 3: return 9; // Ultra
             default: return iRadius; // Custom
         }
     }
@@ -319,7 +319,7 @@ namespace QualitySettings
             case 0: return 1.5;  // Performance
             case 1: return 2.5;  // Balanced
             case 2: return 3.0;  // Quality
-            case 3: return 4.0;  // Ultra
+            case 3: return 3.5;  // Ultra
             default: return fSigmaSpatial; // Custom
         }
     }
@@ -696,3 +696,4 @@ technique lilium__bilateral_contrast <
     }
 
 }
+
