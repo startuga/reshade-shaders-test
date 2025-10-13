@@ -147,7 +147,7 @@ uniform int iRadius <
     ui_min = 1;
     ui_max = 16;
     ui_category = "Filter Parameters";
-> = 7;
+> = 5;
 
 uniform float fSigmaSpatial <
     ui_type = "slider";
@@ -226,7 +226,7 @@ uniform float fGradientSensitivity <
     ui_max = 200.0;
     ui_step = 5.0;
     ui_category = "Advanced Tuning";
-> = 100.0;
+> = 125.0;
 
 uniform float fVarianceWeight <
     ui_type = "slider";
@@ -694,4 +694,5 @@ technique lilium__bilateral_contrast <
         VertexShader = PostProcessVS;
         PixelShader = PS_BilateralContrast;
     }
+
 }
