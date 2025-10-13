@@ -66,7 +66,6 @@
  *   - Effect: Gentler enhancement that preserves smooth transitions
  */
 
-#define BILATERAL_PRECISION half
 #include "ReShade.fxh"
 #include "lilium__include/colour_space.fxh"  // https://github.com/EndlesslyFlowering/ReShade_HDR_shaders/blob/master/Shaders/lilium__include/colour_space.fxh
 
@@ -697,5 +696,6 @@ technique lilium__bilateral_contrast <
     }
 
 }
+
 
 
