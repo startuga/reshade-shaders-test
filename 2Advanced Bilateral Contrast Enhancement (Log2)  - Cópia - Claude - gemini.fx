@@ -12,62 +12,11 @@
  * 8. Performance monitoring and debug modes
  * 9. Content-aware tuning controls for different source material
  *
- * Version: 5.0.8
- * 
- * Changelog:
- * 5.0.8 - FIXED: Performance efficiency calculation in debug modes now correctly uses the 
- *         effective radius, providing an accurate metric for the current operation.
- * 5.0.7 - RESTORED: Log-space (geometric mean) interpolation for the hybrid adaptive metric, improving HDR stability.
- *         REVERTED: Center pixel handling reverted to the simpler and more robust loop-based approach.
- *         FIXED: This also fixes the inaccurate 'pixels_processed' counter and ensures Kahan summation is applied to all samples.
- *         SIMPLIFIED: NaN/Inf handling is now a single, cleaner fallback.
- * 5.0.6 - FIXED: More intuitive and powerful Adaptive Strength logic.
- *         OPTIMIZED: Bilateral filter loop bounds are now tighter, preventing wasted iterations.
- *         FIXED: Minor typo in technique UI label.
- * 5.0.5 - FIXED CRITICAL BUG: Center pixel was sampled twice (once in init, once in loop).
- *         FIXED: Loop now correctly skips center pixel.
- *         IMPROVED: GetLuminance logic clarified for all color spaces.
- *         IMPROVED: Adaptive Strength calculation for intuitive 'fAdaptiveAmount' range.
- * 5.0.4 - Fixed adaptive strength hybrid mode to use weighted average for smooth transitions.
- *         Added advanced exposed controls for content-specific tuning.
- *         Added comprehensive content-type tuning documentation.
- * 5.0.3 - Code quality improvements and constant organization.
- * 5.0.2 - Replaced gradient estimation with zero-cost hardware derivatives (ddx/ddy).
- *         Implemented true circular loop sampling to reduce total iterations by ~21.46%.
- * 5.0.1 - Branchless optimizations.
- * 5.0.0 - Initial feature-rich implementation with variance-based adaptation.
- * 
- * CONTENT-SPECIFIC TUNING GUIDE
- * ==============================
- * 
- * For optimal results, adjust advanced tuning parameters based on content type:
- * 
- * HIGH-FREQUENCY CONTENT (Hair, Foliage, Fabric, Fine Textures):
- *   - Gradient Sensitivity: 50-75 (maintains larger radii in detailed areas)
- *   - Variance Weight: 0.7 (keep default)
- *   - Effect: More natural enhancement of fine structures without over-sharpening
- * 
- * NOISY INPUT (Low-Light, High-ISO, Compressed Video, Film Grain):
- *   - Gradient Sensitivity: 100 (keep default)
- *   - Variance Weight: 0.8-0.9 (conservative, resists noise amplification)
- *   - Adaptive Curve: 2.0-2.5 (reduces sensitivity to noise-inflated variance)
- *   - Effect: Cleaner results without enhancing noise artifacts
- * 
- * CLEAN CGI (Renders, Vector Graphics, Game Screenshots):
- *   - Gradient Sensitivity: 100 (keep default)
- *   - Variance Weight: 0.5-0.6 (balanced toward dynamic range)
- *   - Adaptive Curve: 1.0-1.3 (more aggressive, no noise concerns)
- *   - Effect: Better detection of both geometric and textural detail
- * 
- * SMOOTH CONTENT (Portraits, Skies, Gradients, Soft Lighting):
- *   - Gradient Sensitivity: 125-150 (aggressive radius reduction in flat areas)
- *   - Variance Weight: 0.7 (keep default)
- *   - Range Sigma: 0.4-0.5 (softer edge preservation)
- *   - Effect: Gentler enhancement that preserves smooth transitions
+ * Version: 5.0.8 (Cleaned)
  */
 
 #include "ReShade.fxh"
-#include "lilium__include/colour_space.fxh" // https://github.com/EndlesslyFlowering/ReShade_HDR_shaders/blob/master/Shaders/lilium__include/colour_space.fxh
+#include "lilium__include/colour_space.fxh"  // https://github.com/EndlesslyFlowering/ReShade_HDR_shaders/blob/master/Shaders/lilium__include/colour_space.fxh
 
 // ==============================================================================
 // UI Configuration
@@ -266,25 +215,19 @@ uniform bool bShowStatistics <
 
 namespace Constants
 {
-    // Precision and stability constants
     static const float LUMA_EPSILON = 1e-8f;
     static const float WEIGHT_THRESHOLD = 1e-7f;
-    static const float RATIO_MAX = 8.0f; // exp2(3.0)
-    static const float RATIO_MIN = 0.125f; // exp2(-3.0)
-
-    // Adaptive strength constants
-    static const float MIN_DYNAMIC_RANGE = 0.05f; // Minimum dynamic range in stops
-    static const float MAX_DYNAMIC_RANGE = 10.0f; // Maximum expected dynamic range in stops
-    static const float MIN_VARIANCE_SQ = 0.001f * 0.001f; // Minimum variance threshold
-    static const float MAX_VARIANCE_SQ = 2.0f * 2.0f; // Maximum expected variance in log2 space
-
-    // Optimization constants
-    static const float SPATIAL_CUTOFF_SIGMA = 3.0f; // Process within 3 sigma (99.7% of Gaussian)
+    static const float RATIO_MAX = 8.0f;
+    static const float RATIO_MIN = 0.125f;
+    static const float MIN_DYNAMIC_RANGE = 0.05f;
+    static const float MAX_DYNAMIC_RANGE = 10.0f;
+    static const float MIN_VARIANCE_SQ = 0.001f * 0.001f;
+    static const float MAX_VARIANCE_SQ = 2.0f * 2.0f;
+    static const float SPATIAL_CUTOFF_SIGMA = 3.0f;
 }
 
 namespace FxUtils
 {
-    // Kahan summation for improved numerical stability
     void KahanSum(inout float sum, inout float compensation, const float input)
     {
         const float y = input - compensation;
@@ -302,35 +245,25 @@ namespace QualitySettings
 {
     int GetRadius()
     {
-        switch (iQualityPreset)
+        switch(iQualityPreset)
         {
-        case 0:
-            return 3; // Performance
-        case 1:
-            return 4; // Balanced
-        case 2:
-            return 6; // Quality
-        case 3:
-            return 9; // Ultra
-        default:
-            return iRadius; // Custom
+            case 0: return 3;  // Performance
+            case 1: return 4;  // Balanced
+            case 2: return 6;  // Quality
+            case 3: return 9; // Ultra
+            default: return iRadius; // Custom
         }
     }
-
+    
     float GetSpatialSigma()
     {
-        switch (iQualityPreset)
+        switch(iQualityPreset)
         {
-        case 0:
-            return 1.5; // Performance
-        case 1:
-            return 2.5; // Balanced
-        case 2:
-            return 3.0; // Quality
-        case 3:
-            return 3.5; // Ultra
-        default:
-            return fSigmaSpatial; // Custom
+            case 0: return 1.5;  // Performance
+            case 1: return 2.5;  // Balanced
+            case 2: return 3.0;  // Quality
+            case 3: return 3.5;  // Ultra
+            default: return fSigmaSpatial; // Custom
         }
     }
 }
@@ -343,55 +276,39 @@ namespace ColorScience
 {
     float3 DecodeToLinear(float3 color)
     {
-#if (ACTUAL_COLOUR_SPACE == CSP_SRGB)
-        color = DECODE_SDR(color);
-#elif (ACTUAL_COLOUR_SPACE == CSP_SCRGB)
-        // Convert to linear BT.2020 normalised for unified processing
-        color = Csp::Mat::ScRgbTo::Bt2020Normalised(color);
-#elif (ACTUAL_COLOUR_SPACE == CSP_HDR10)
-        // Decode PQ to linear BT.2020 normalised
-        color = Csp::Trc::PqTo::Linear(color);
-#endif
-
+        #if (ACTUAL_COLOUR_SPACE == CSP_SRGB)
+            color = DECODE_SDR(color);
+        #elif (ACTUAL_COLOUR_SPACE == CSP_SCRGB)
+            color = Csp::Mat::ScRgbTo::Bt2020Normalised(color);
+        #elif (ACTUAL_COLOUR_SPACE == CSP_HDR10)
+            color = Csp::Trc::PqTo::Linear(color);
+        #endif
         return color;
     }
 
     float3 EncodeFromLinear(float3 color)
-    {
-#if (ACTUAL_COLOUR_SPACE == CSP_SRGB)
-        color = ENCODE_SDR(color);
-#elif (ACTUAL_COLOUR_SPACE == CSP_SCRGB)
-        // Convert back from linear BT.2020 normalised to scRGB (linear BT.709-derived)
-        color = Csp::Mat::Bt2020NormalisedTo::ScRgb(color);
-#elif (ACTUAL_COLOUR_SPACE == CSP_HDR10)
-        // Encode linear BT.2020 normalised to PQ
-        color = Csp::Trc::LinearTo::Pq(color);
-#endif
-
+    {        
+        #if (ACTUAL_COLOUR_SPACE == CSP_SRGB)
+            color = ENCODE_SDR(color);
+        #elif (ACTUAL_COLOUR_SPACE == CSP_SCRGB)
+            color = Csp::Mat::Bt2020NormalisedTo::ScRgb(color);
+        #elif (ACTUAL_COLOUR_SPACE == CSP_HDR10)
+            color = Csp::Trc::LinearTo::Pq(color);
+        #endif
         return color;
     }
 
     float GetLuminance(const float3 linearColour)
     {
-        // Lum coefficients match the final linear space produced by DecodeToLinear
-#if (ACTUAL_COLOUR_SPACE == CSP_SRGB)
-        // Linear BT.709-derived coefficients
-        return dot(linearColour, Csp::Mat::Bt709ToXYZ[1]);
-#else
-        // Linear BT.2020-derived coefficients (used for SCRGB/HDR10 output space)
-        return dot(linearColour, Csp::Mat::Bt2020ToXYZ[1]);
-#endif
+        #if (ACTUAL_COLOUR_SPACE == CSP_SRGB)
+            return dot(linearColour, Csp::Mat::Bt709ToXYZ[1]);
+        #else
+            return dot(linearColour, Csp::Mat::Bt2020ToXYZ[1]);
+        #endif
     }
 
-    float LinearToLog2Ratio(const float linear_luma)
-    {
-        return log2(max(linear_luma, Constants::LUMA_EPSILON));
-    }
-
-    float Log2RatioToLinear(const float log2_ratio)
-    {
-        return exp2(log2_ratio);
-    }
+    float LinearToLog2Ratio(const float linear_luma) { return log2(max(linear_luma, Constants::LUMA_EPSILON)); }
+    float Log2RatioToLinear(const float log2_ratio) { return exp2(log2_ratio); }
 }
 
 // ==============================================================================
@@ -400,84 +317,53 @@ namespace ColorScience
 
 namespace BilateralFilter
 {
-    // OPTIMIZATION: Calculate adaptive radius based on local gradient
     int GetAdaptiveRadius(float log2_luma, int base_radius)
     {
-        // Use hardware derivatives for a virtually zero-cost gradient approximation
         float gx = ddx(log2_luma);
         float gy = ddy(log2_luma);
         float gradient_sq = gx * gx + gy * gy;
-
-        // Avoid sqrt by working in squared space
-        // Reduce radius in flat areas, maintain in detailed areas
-        const float GRADIENT_SQ_THRESHOLD = 0.25; // = 0.5^2
+        const float GRADIENT_SQ_THRESHOLD = 0.25;
         const float radius_scale = smoothstep(0.0, GRADIENT_SQ_THRESHOLD, gradient_sq * fGradientSensitivity);
         const float adaptive_factor = lerp(0.5, 1.0, radius_scale);
         return max(1, (int)(base_radius * adaptive_factor + 0.5));
     }
-
-    // Calculate adaptive strength using weighted average for smooth transitions
+    
     float CalculateAdaptiveStrength(
         const float local_dynamic_range, const float local_variance,
         const float base_strength, const float adaptive_amount,
         const float adaptive_curve, const int mode)
     {
         float metric;
-        if (mode == 0)
-        {
-            // Dynamic Range only
-            metric = saturate((local_dynamic_range - Constants::MIN_DYNAMIC_RANGE) /
-                (Constants::MAX_DYNAMIC_RANGE - Constants::MIN_DYNAMIC_RANGE));
-        }
-        else if (mode == 1)
-        {
-            // Variance only
-            metric = saturate((local_variance - Constants::MIN_VARIANCE_SQ) /
-                (Constants::MAX_VARIANCE_SQ - Constants::MIN_VARIANCE_SQ));
-        }
-        else
-        {
-            // Hybrid: Log-space interpolation (geometric mean) for HDR stability
-            float range_metric = saturate((local_dynamic_range - Constants::MIN_DYNAMIC_RANGE) /
-                (Constants::MAX_DYNAMIC_RANGE - Constants::MIN_DYNAMIC_RANGE));
-            float variance_metric = saturate((local_variance - Constants::MIN_VARIANCE_SQ) /
-                (Constants::MAX_VARIANCE_SQ - Constants::MIN_VARIANCE_SQ));
-
-            // Add epsilon to prevent pow(0, x) issues
+        if (mode == 0) { // Dynamic Range
+            metric = saturate((local_dynamic_range - Constants::MIN_DYNAMIC_RANGE) / (Constants::MAX_DYNAMIC_RANGE - Constants::MIN_DYNAMIC_RANGE));
+        } else if (mode == 1) { // Variance
+            metric = saturate((local_variance - Constants::MIN_VARIANCE_SQ) / (Constants::MAX_VARIANCE_SQ - Constants::MIN_VARIANCE_SQ));
+        } else { // Hybrid
+            float range_metric = saturate((local_dynamic_range - Constants::MIN_DYNAMIC_RANGE) / (Constants::MAX_DYNAMIC_RANGE - Constants::MIN_DYNAMIC_RANGE));
+            float variance_metric = saturate((local_variance - Constants::MIN_VARIANCE_SQ) / (Constants::MAX_VARIANCE_SQ - Constants::MIN_VARIANCE_SQ));
             range_metric = max(range_metric, 1e-6);
             variance_metric = max(variance_metric, 1e-6);
-
-            const float range_weight = 1.0 - fVarianceWeight;
-            metric = pow(range_metric, range_weight) * pow(variance_metric, fVarianceWeight);
+            metric = pow(range_metric, 1.0 - fVarianceWeight) * pow(variance_metric, fVarianceWeight);
         }
-
+        
         const float modulation = pow(metric, adaptive_curve);
-        // Lerp from base multiplier (1.0) to a modulated multiplier (0x to 2x)
         const float adaptive_multiplier = lerp(1.0, modulation * 2.0, adaptive_amount);
         return base_strength * adaptive_multiplier;
     }
-
-    // Protection function for shadows and highlights
+    
     float CalculateToneProtection(float log2_luma, float dark_threshold, float bright_threshold)
     {
         float protection = 1.0;
-
-        // Shadow protection
         if (dark_threshold > 1e-6)
         {
             const float dark_log2 = ColorScience::LinearToLog2Ratio(dark_threshold);
-            // Smoothly fade to zero as log2_luma drops from dark_log2 + 0.5 to dark_log2 - 0.5
             protection *= smoothstep(dark_log2 - 0.5, dark_log2 + 0.5, log2_luma);
         }
-
-        // Highlight protection
         if (bright_threshold > 1e-6)
         {
             const float bright_log2 = ColorScience::LinearToLog2Ratio(bright_threshold);
-            // Smoothly fade to zero as log2_luma rises from bright_log2 - 0.5 to bright_log2 + 0.5
             protection *= 1.0 - smoothstep(bright_log2 - 0.5, bright_log2 + 0.5, log2_luma);
         }
-
         return protection;
     }
 }
@@ -486,22 +372,25 @@ namespace BilateralFilter
 // Main Pixel Shader
 // ==============================================================================
 
-void PS_BilateralContrast(float4 vpos: SV_Position, float2 texcoord: TEXCOORD0, out float4 fragColor: SV_Target)
+void PS_BilateralContrast(float4 vpos : SV_Position, float2 texcoord : TEXCOORD0, out float4 fragColor : SV_Target)
 {
+    // --- 1. Initial Data Fetch ---
+    // Get center pixel data and convert to a linear log2 format for processing.
     const int2 center_pos = int2(vpos.xy);
     const float3 color_encoded = tex2Dfetch(SamplerBackBuffer, center_pos).rgb;
     const float3 color_linear = ColorScience::DecodeToLinear(color_encoded);
     const float luma_linear = max(ColorScience::GetLuminance(color_linear), Constants::LUMA_EPSILON);
     const float log2_ratio_center = ColorScience::LinearToLog2Ratio(luma_linear);
-
+    
+    // --- 2. Setup Kernel Parameters ---
+    // Determine the filter radius and sigma values based on UI settings or presets.
     const int base_radius = QualitySettings::GetRadius();
     int effective_radius = base_radius;
     if (bAdaptiveRadius && base_radius > 2)
     {
         effective_radius = BilateralFilter::GetAdaptiveRadius(log2_ratio_center, base_radius);
 
-        // Early return for adaptive radius visualization (before expensive filtering)
-        if (iDebugMode == 5)
+        if (iDebugMode == 5) // Early exit for adaptive radius debug view
         {
             float radius_norm = (float)effective_radius / (float)QualitySettings::GetRadius();
             fragColor.rgb = lerp(float3(0, 0, 1), float3(1, 0, 0), radius_norm);
@@ -509,53 +398,55 @@ void PS_BilateralContrast(float4 vpos: SV_Position, float2 texcoord: TEXCOORD0, 
             return;
         }
     }
-
+    
     const float sigma_spatial = QualitySettings::GetSpatialSigma();
     const float inv_2_sigma_spatial_sq = 0.5 / (sigma_spatial * sigma_spatial);
     const float inv_2_sigma_range_sq = 0.5 / (max(fSigmaRange, 0.01) * max(fSigmaRange, 0.01));
-
-    // If enabled, cutoff_radius is 3 sigma, otherwise it's just the effective_radius
+    
+    // Calculate the actual loop boundary, capped by either the effective radius or 3*sigma.
     const float cutoff_radius = bEnableSpatialCutoff ? min((float)effective_radius, Constants::SPATIAL_CUTOFF_SIGMA * sigma_spatial) : (float)effective_radius;
     const float cutoff_radius_sq = cutoff_radius * cutoff_radius;
-    // OPTIMIZATION: Use integer truncation (floor) for the max loop bound.
     const int max_radius = (int)cutoff_radius;
-
-    // Initialize sums to zero. The loop will correctly handle the center pixel.
+    
+    // --- 3. Run Bilateral Filter Loop ---
+    // Initialize accumulators for Kahan summation.
     float sum_log2 = 0.0, compensation_log2 = 0.0;
     float sum_log2_sq = 0.0, compensation_log2_sq = 0.0;
     float sum_weight = 0.0, compensation_weight = 0.0;
     float min_log2 = log2_ratio_center, max_log2 = log2_ratio_center;
     int pixels_processed = 0;
 
-    // OPTIMIZATION: True circular loop.
+    // Iterate in a circular pattern around the center pixel.
     [loop]
     for (int y = -max_radius; y <= max_radius; ++y)
     {
         const float y_sq = (float)(y * y);
-        // Calculate the horizontal extent for this row to form a circle
         const int x_max = (int)sqrt(max(0.0, cutoff_radius_sq - y_sq));
-
+        
         [loop]
         for (int x = -x_max; x <= x_max; ++x)
         {
             pixels_processed++;
             const float r2 = (float)(x * x) + y_sq;
-
+            
+            // Sample neighbor pixel and calculate its log2 luminance.
             const int2 sample_pos = center_pos + int2(x, y);
             const float3 neighbor_linear = ColorScience::DecodeToLinear(tex2Dfetch(SamplerBackBuffer, sample_pos).rgb);
             const float log2_ratio_neighbor = ColorScience::LinearToLog2Ratio(max(ColorScience::GetLuminance(neighbor_linear), Constants::LUMA_EPSILON));
-
+            
+            // Calculate spatial and range weights.
             const float d = log2_ratio_center - log2_ratio_neighbor;
             const float spatial_exponent = -r2 * inv_2_sigma_spatial_sq;
             const float range_exponent = -(d * d) * inv_2_sigma_range_sq;
             const float weight = exp(spatial_exponent + range_exponent);
-
+            
+            // Accumulate weighted values if the weight is significant.
             if (weight > Constants::WEIGHT_THRESHOLD)
             {
                 FxUtils::KahanSum(sum_log2, compensation_log2, log2_ratio_neighbor * weight);
                 FxUtils::KahanSum(sum_log2_sq, compensation_log2_sq, log2_ratio_neighbor * log2_ratio_neighbor * weight);
                 FxUtils::KahanSum(sum_weight, compensation_weight, weight);
-
+                
                 if (bAdaptiveStrength)
                 {
                     min_log2 = min(min_log2, log2_ratio_neighbor);
@@ -564,125 +455,97 @@ void PS_BilateralContrast(float4 vpos: SV_Position, float2 texcoord: TEXCOORD0, 
             }
         }
     }
-
+    
+    // --- 4. Calculate Final Color ---
     float3 enhanced_linear = color_linear;
     if (sum_weight > Constants::WEIGHT_THRESHOLD)
     {
+        // Get the difference between the center pixel and the blurred average.
         const float blurred_log2_ratio = sum_log2 / sum_weight;
         float log2_diff = log2_ratio_center - blurred_log2_ratio;
 
+        // Calculate adaptive strength if enabled.
         float effective_strength = fStrength;
         if (bAdaptiveStrength)
         {
             const float local_dynamic_range = max_log2 - min_log2;
             const float mean_log2 = sum_log2 / sum_weight;
             const float mean_sq_log2 = sum_log2_sq / sum_weight;
-            // Guard against floating point imprecision causing negative variance
             const float local_variance = max(Constants::MIN_VARIANCE_SQ, mean_sq_log2 - mean_log2 * mean_log2);
-
+            
             effective_strength = BilateralFilter::CalculateAdaptiveStrength(
-                local_dynamic_range, local_variance, fStrength,
+                local_dynamic_range, local_variance, fStrength, 
                 fAdaptiveAmount, fAdaptiveCurve, iAdaptiveMode
             );
         }
-
-        // Apply tone protection (shadows and highlights)
-        const float tone_protection = BilateralFilter::CalculateToneProtection(
-            log2_ratio_center, fDarkProtection, fHighlightProtection
-        );
-        log2_diff *= tone_protection;
-
-        // Apply enhancement
+        
+        // Apply protection to prevent crushing shadows or blowing out highlights.
+        log2_diff *= BilateralFilter::CalculateToneProtection(log2_ratio_center, fDarkProtection, fHighlightProtection);
+        
+        // Apply the enhancement and convert back to linear luma.
         const float enhanced_log2_ratio = log2_ratio_center + effective_strength * log2_diff;
         const float enhanced_luma_linear = ColorScience::Log2RatioToLinear(enhanced_log2_ratio);
-
-        // Preserve color ratios
-        {
-            const float inv_luma_linear = 1.0 / luma_linear; // Already guaranteed > LUMA_EPSILON earlier
-            const float ratio = enhanced_luma_linear * inv_luma_linear;
-            enhanced_linear = color_linear * clamp(ratio, Constants::RATIO_MIN, Constants::RATIO_MAX);
-        }
-
-        // Debug visualizations
+        
+        // Apply the luma change to the original color while preserving hue and saturation.
+        const float ratio = enhanced_luma_linear / luma_linear;
+        enhanced_linear = color_linear * clamp(ratio, Constants::RATIO_MIN, Constants::RATIO_MAX);
+        
+        // --- 5. Apply Debug Visualizations (if enabled) ---
         if (iDebugMode > 0)
         {
-            switch (iDebugMode)
+            switch(iDebugMode)
             {
-            case 1:
-                // Show weights
-                enhanced_linear = float3(sum_weight, sum_weight, sum_weight);
-                break;
-
-            case 2:
-                // Show local variance
+                case 1: enhanced_linear = sum_weight.xxx; break;
+                case 2:
                 {
                     const float mean_log2 = sum_log2 / sum_weight;
                     const float mean_sq_log2 = sum_log2_sq / sum_weight;
                     const float variance = max(0.0, mean_sq_log2 - mean_log2 * mean_log2);
-                    // Scale variance for visibility
-                    enhanced_linear = float3(variance * 10.0, variance * 5.0, 0.0);
+                    enhanced_linear = float3(variance * 10.0, variance * 5.0, 0.0); 
                     break;
                 }
-
-            case 3:
-                // Show dynamic range
+                case 3:
                 {
                     const float range = (max_log2 - min_log2) * 0.2;
                     enhanced_linear = float3(range, range * 0.5, 0.0);
                     break;
                 }
-
-            case 4:
-                // Show enhancement map
+                case 4:
                 {
                     const float enhancement = abs(log2_diff) * effective_strength * 2.0;
                     enhanced_linear = lerp(float3(0, 0, 1), float3(1, 0, 0), enhancement);
                     break;
                 }
-
-            case 6:
-                // Performance heatmap
+                case 6:
                 {
-                    // FIX: Use effective_radius for an accurate efficiency metric
-                    const float total_possible_pixels_in_square = (float)((effective_radius * 2 + 1) * (effective_radius * 2 + 1));
-                    const float efficiency = (float)pixels_processed / max(total_possible_pixels_in_square, 1.0);
+                    const float total_pixels = (float)((effective_radius * 2 + 1) * (effective_radius * 2 + 1));
+                    const float efficiency = (float)pixels_processed / max(total_pixels, 1.0);
                     enhanced_linear = lerp(float3(1, 0, 0), float3(0, 1, 0), efficiency);
                     break;
                 }
             }
         }
     }
-
-    // Final validation and encoding
-    enhanced_linear = max(enhanced_linear, 0.0);
-
-    // SIMPLIFIED NaN/Inf check
+    
+    // --- 6. Final Validation and Encoding ---
     if (any(isnan(enhanced_linear) || isinf(enhanced_linear)))
     {
-        enhanced_linear = color_linear; // Fallback to unprocessed pixel
+        enhanced_linear = color_linear; // Fallback to original color on error.
     }
-
-    // Encode back to output color space
-    fragColor.rgb = ColorScience::EncodeFromLinear(enhanced_linear);
+    
+    fragColor.rgb = ColorScience::EncodeFromLinear(max(enhanced_linear, 0.0));
     fragColor.a = 1.0;
-
-    // Show performance statistics overlay
+    
+    // --- 7. Show Performance Statistics Overlay ---
     if (bShowStatistics && center_pos.x < 200 && center_pos.y < 20)
     {
-        // Darken the background of the 200x20 region
-        fragColor.rgb *= 0.3;
-
-        // Draw the performance bar between y=5 and y=15
-        if (center_pos.y >= 5 && center_pos.y < 15)
+        fragColor.rgb *= 0.3; 
+        if (center_pos.y >= 5 && center_pos.y < 15) 
         {
-            // FIX: Use effective_radius for an accurate efficiency metric
-            const float total_possible_pixels_in_square = (float)((effective_radius * 2 + 1) * (effective_radius * 2 + 1));
-            const float efficiency = (float)pixels_processed / max(total_possible_pixels_in_square, 1.0);
-
-            float bar_position = (float)center_pos.x / 199.0;
-            if (bar_position < efficiency)
+            const float total_pixels = (float)((effective_radius * 2 + 1) * (effective_radius * 2 + 1));
+            const float efficiency = (float)pixels_processed / max(total_pixels, 1.0);
+            if ((float)center_pos.x / 199.0 < efficiency)
             {
-                // Green (good) to Red (bad)
                 fragColor.rgb = lerp(float3(1, 0, 0), float3(0, 1, 0), efficiency);
             }
         }
@@ -696,17 +559,17 @@ void PS_BilateralContrast(float4 vpos: SV_Position, float2 texcoord: TEXCOORD0, 
 technique lilium__bilateral_contrast <
     ui_label = "Lilium: Physically Correct Bilateral Contrast v5.0.8";
     ui_tooltip = "Academically rigorous local contrast enhancement with content-aware tuning.\n\n"
-    "New in v5.0.8:\n"
-    "• FIXED: Performance efficiency calculation in debug modes now correctly uses the\n"
-    "  effective radius, providing an accurate metric for the current operation.\n\n"
-    "Features:\n"
-    "• Correct log2 luminance ratio processing\n"
-    "• Pure Gaussian bilateral filtering\n"
-    "• Variance-based adaptive strength\n"
-    "• Content-aware optimization controls\n"
-    "• SDR/HDR support with proper color preservation\n"
-    "• Numerical stability through Kahan summation\n\n"
-    "See shader header for content-specific tuning guide.";
+                 "New in v5.0.8:\n"
+                 "• FIXED: Performance efficiency calculation in debug modes now correctly uses the\n"
+                 "  effective radius, providing an accurate metric for the current operation.\n\n"
+                 "Features:\n"
+                 "• Correct log2 luminance ratio processing\n"
+                 "• Pure Gaussian bilateral filtering\n"
+                 "• Variance-based adaptive strength\n"
+                 "• Content-aware optimization controls\n"
+                 "• SDR/HDR support with proper color preservation\n"
+                 "• Numerical stability through Kahan summation\n\n"
+                 "See shader header for content-specific tuning guide.";
 >
 {
     pass
@@ -714,4 +577,5 @@ technique lilium__bilateral_contrast <
         VertexShader = PostProcessVS;
         PixelShader = PS_BilateralContrast;
     }
+
 }
