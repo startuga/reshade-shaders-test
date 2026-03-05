@@ -1,13 +1,12 @@
 // =========================================================================
-// Photoreal HDR Color Grader (V5.1 - Mastering Edition)
+// Photoreal HDR Color Grader (V5.2 - Mastering Edition)
 // Designed to remove "game-y" dusty filters and yellow tints.
 // Companion shader to Bilateral Contrast v8.4.1.
 //
-// V5.1 Changes from V5:
-// - Fix: Smooth Hermite black point (eliminates gradient banding at clip edge)
-// - Fix: Contrast ratio clamped to prevent FP overflow in extreme HDR
-// - Fix: Bypass optimization for neutral settings
-// - Fix: Improved tooltips documenting WB/saturation behavior
+// V5.2 Changes from V5.1:
+// - Feature: Smart Saturation / Perceptual Vibrance (Protects highly 
+//   saturated colors like skies from neon-clipping while boosting dull tones)
+// - Fix: UI Labels updated to reflect Vibrance logic
 // =========================================================================
 
 #include "ReShade.fxh"
@@ -136,11 +135,9 @@ uniform float fTint <
 uniform float fSaturation <
     ui_type = "slider";
     ui_min = 0.00; ui_max = 2.00; ui_step = 0.01;
-    ui_label = "Saturation";
-    ui_tooltip = "Luminance-based linear interpolation.\n"
-                 "Values above 1.0 may push saturated colors out of gamut.\n"
-                 "SDR: out-of-gamut values clipped by output saturate().\n"
-                 "HDR: out-of-gamut values preserved (WCG passthrough).";
+    ui_label = "Saturation / Vibrance";
+    ui_tooltip = "Smart Perceptual Saturation.\n"
+                 "Boosts dull colors (sand, stone) while protecting already vivid colors (sky, fire) from neon-clipping.";
     ui_category = "Color Balance";
 > = 1.15;
 
@@ -297,7 +294,7 @@ void PS_PhotorealHDR(float4 vpos : SV_Position, float2 texcoord : TEXCOORD, out 
     float3 lumaCoeffs = (space >= 3) ? Luma2020 : Luma709;
     float whitePt = (space <= 1) ? SCRGB_WHITE_NITS : fWhitePoint;
 
-    // [v5.1] Fast bypass when all controls are at neutral positions
+    // Fast bypass when all controls are at neutral positions
     [branch]
     if (fExposure == 0.0 && fBlackPoint == 0.0 && fContrast == 1.0 &&
         fTemperature == 0.0 && fTint == 0.0 && fSaturation == 1.0) {
@@ -344,10 +341,25 @@ void PS_PhotorealHDR(float4 vpos : SV_Position, float2 texcoord : TEXCOORD, out 
     float contrastRatio = min(contrastLuma / absLuma, 100.0);
     color *= contrastRatio;
 
-    // === 6. Saturation ===
-    // Recalculate luma after all tonal modifications
+    // === 6. Perceptual Vibrance / Smart Saturation ===
+    // Calculates pixel purity (current saturation) in linear space
+    float max_c = max(color.r, max(color.g, color.b));
+    float min_c = min(color.r, min(color.g, color.b));
+    
+    // Avoids div-by-zero and deep black artifacts
+    float sat_current = (max_c > 1e-6) ? (max_c - min_c) / max_c : 0.0;
+    
+    // Color protection curve: already vivid colors reduce the saturation impact.
+    // Factor 0.75 dictates the protection strength (higher = more protection for vibrant colors).
+    float vibrance_protection = 1.0 - (sat_current * 0.75);
+    
+    // Recalculate luma after tonal modifications
     luma = dot(color, lumaCoeffs);
-    color = lerp((float3)luma, color, fSaturation);
+    
+    // The effective saturation adapts to each pixel
+    float effective_sat = 1.0 + (fSaturation - 1.0) * vibrance_protection;
+    
+    color = lerp((float3)luma, color, effective_sat);
 
     // === 7. Safety: NaN/Inf Guard ===
     if (any(IsNan3(color)) || any(IsInf3(color))) {
@@ -370,18 +382,18 @@ void PS_PhotorealHDR(float4 vpos : SV_Position, float2 texcoord : TEXCOORD, out 
 // ==============================================================================
 
 technique PhotorealHDR_Mastering <
-    ui_label = "Photoreal HDR V5.1 (Mastering Edition)";
+    ui_label = "Photoreal HDR V5.2 (Mastering Edition)";
     ui_tooltip = "Photorealistic grading designed for HDR and SDR displays.\n\n"
                  "Processing Pipeline:\n"
                  "  1. Exposure (linear EV shift)\n"
                  "  2. White Balance (luminance-preserving LMS)\n"
                  "  3. Dehaze / Black Point (smooth Hermite knee)\n"
                  "  4. Filmic Contrast (luminance-based, chromaticity-preserving)\n"
-                 "  5. Saturation (luminance-weighted)\n\n"
-                 "V5.1 Fixes:\n"
+                 "  5. Smart Vibrance (perceptual saturation)\n\n"
+                 "V5.2 Fixes:\n"
+                 "- Added Perceptual Vibrance logic (protects naturally vivid colors)\n"
                  "- Smooth Hermite black point (no gradient banding)\n"
-                 "- Contrast ratio overflow protection for HDR\n"
-                 "- Bypass optimization for neutral settings\n\n"
+                 "- Contrast ratio overflow protection for HDR\n\n"
                  "Companion shader: Bilateral Contrast v8.4.1";
 >
 {
