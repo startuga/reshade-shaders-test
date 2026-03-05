@@ -1,7 +1,7 @@
 // =========================================================================
-// Photoreal HDR Color Grader
+// Photoreal HDR Color Grader (V3 - WCG Gamut Preserving)
 // Designed specifically to remove "game-y" dusty filters and yellow tints
-// while 100% preserving High Dynamic Range (HDR) peak brightness.
+// while 100% preserving HDR peak brightness AND Wide Color Gamut.
 // =========================================================================
 
 #include "ReShade.fxh"
@@ -18,7 +18,7 @@ uniform float fTemperature <
     ui_min = -0.50; ui_max = 0.50; ui_step = 0.01;
     ui_label = "Color Temperature";
     ui_tooltip = "Negative = Cooler (Removes yellow/sand tint)\nPositive = Warmer";
-> = -0.12; // Default negative to cool down AC Mirage's heavy yellow tint
+> = -0.12; 
 
 uniform float fTint <
     ui_type = "slider";
@@ -46,12 +46,16 @@ uniform float fSaturation <
     ui_label = "HDR Saturation";
 > = 1.15;
 
-// Rec.2020 Luma coefficients (Standard color space for HDR scRGB)
-static const float3 LumaCoeff = float3(0.2627, 0.6780, 0.0593);
+// Dynamically assign accurate Luma coefficients based on the game's HDR output format
+#if BUFFER_COLOR_SPACE == 3 // HDR10 (BT.2020 primaries)
+    static const float3 LumaCoeff = float3(0.2627, 0.6780, 0.0593);
+#else                       // scRGB (BT.709 primaries) or SDR
+    static const float3 LumaCoeff = float3(0.2126, 0.7152, 0.0722);
+#endif
 
 float3 ApplyTemperature(float3 color, float temp, float tint) 
 {
-    // Adjusts balance linearly (safe for HDR)
+    // Adjusts balance linearly. Multipliers preserve negative WCG values.
     float3 balance = float3(1.0 + temp, 1.0, 1.0 - temp);
     balance *= float3(1.0 + tint, 1.0 - tint, 1.0 + tint);
     return color * balance;
@@ -59,32 +63,41 @@ float3 ApplyTemperature(float3 color, float temp, float tint)
 
 float4 PS_PhotorealHDR(float4 vpos : SV_Position, float2 texcoord : TEXCOORD) : SV_Target 
 {
-    // Sample the backbuffer. In HDR mode, values can be well over 1.0.
+    // Sample the backbuffer. 
+    // In scRGB HDR, colors > 1.0 are highlights, and colors < 0.0 are WCG (Wide Color Gamut).
     float3 color = tex2D(ReShade::BackBuffer, texcoord).rgb;
 
-    // 1. Exposure
+    // 1. Exposure (Multiplication safely scales negatives)
     color *= exp2(fExposure);
 
-    // 2. Black Point (Dehaze)
-    // Removes the gray/brown low-end haze without touching the midtones.
-    color = max(0.0, color - fBlackPoint);
+    // 2. Black Point (Dehaze) - Hue Preserving
+    // By calculating a scalar multiplier based on luma, we preserve RGB ratios and negative WCG signs.
+    float luma = dot(color, LumaCoeff);
+    float newLuma = max(0.0, luma - fBlackPoint);
+    color *= (luma > 1e-6) ? (newLuma / luma) : 0.0; 
 
     // 3. White Balance
     color = ApplyTemperature(color, fTemperature, fTint);
 
-    // 4. Log Contrast
-    // Standard linear contrast ruins HDR. Log contrast curves the midtones 
-    // around an 18% gray pivot while allowing peaks to remain unbounded.
+    // 4. Log Contrast (WCG SAFE)
+    // We cannot use log2() on negative WCG values, and max(0.0) strips them entirely.
+    // Solution: Extract the sign, apply the contrast curve to the absolute values, and restore the sign.
     const float pivot = 0.18; 
-    float3 logColor = log2(color + 1e-6);
+    
+    float3 colorSign = sign(color);
+    float3 absColor = abs(color);
+    
+    float3 logColor = log2(absColor + 1e-6);
     logColor = log2(pivot) + (logColor - log2(pivot)) * fContrast;
-    color = max(0.0, exp2(logColor) - 1e-6);
+    
+    // Apply exp2 to the magnitude, then multiply back the original sign to restore WCG
+    color = colorSign * max(0.0, exp2(logColor) - 1e-6);
 
     // 5. Saturation
-    float luma = dot(color, LumaCoeff);
+    // Recalculate luma. lerp() naturally expands WCG colors safely.
+    luma = dot(color, LumaCoeff);
     color = lerp((float3)luma, color, fSaturation);
 
-    // DO NOT USE saturate()! It clips HDR signals. Let the values go > 1.0.
     return float4(color, 1.0);
 }
 
