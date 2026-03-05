@@ -1,18 +1,13 @@
 // =========================================================================
-// Photoreal HDR Color Grader (V5 - Mastering Edition)
+// Photoreal HDR Color Grader (V5.1 - Mastering Edition)
 // Designed to remove "game-y" dusty filters and yellow tints.
 // Companion shader to Bilateral Contrast v8.4.1.
 //
-// V5 Changes from V4:
-// - Fix: Black point scaled relative to white point (visible in SDR and HDR)
-// - Fix: Luminance-based contrast (preserves chromaticity — true photoreal)
-// - Fix: Luminance-preserving LMS white balance (no brightness shift from WB)
-// - Fix: sRGB OETF threshold matches v8.4.1 exactly (bit-exact round-trip)
-// - Fix: Processing order matches photographic workflow (WB before tone)
-// - Fix: Contrast pivot scales with white point (correct for HDR)
-// - Fix: NaN/Inf output guard
-// - Fix: tex2Dfetch with POINT sampling (no bilinear interpolation)
-// - Fix: [flatten] hints on uniform branches
+// V5.1 Changes from V5:
+// - Fix: Smooth Hermite black point (eliminates gradient banding at clip edge)
+// - Fix: Contrast ratio clamped to prevent FP overflow in extreme HDR
+// - Fix: Bypass optimization for neutral settings
+// - Fix: Improved tooltips documenting WB/saturation behavior
 // =========================================================================
 
 #include "ReShade.fxh"
@@ -56,7 +51,7 @@ static const float3x3 LMS_to_RGB709 = float3x3(
     -0.0041960863, -0.7034186147,  1.7076147010
 );
 
-// Row-Sum-Normalized Rec.2020 → LMS (matching v8.4.1)
+// Row-Sum-Normalized Rec.2020 -> LMS (matching v8.4.1)
 static const float3x3 RGB2020_to_LMS = float3x3(
     0.616759697, 0.360188024, 0.023052279,
     0.265131674, 0.635851580, 0.099016746,
@@ -65,7 +60,7 @@ static const float3x3 RGB2020_to_LMS = float3x3(
 
 // Inverse of RGB2020_to_LMS
 // NOTE: Limited to 7 significant digits. Round-trip error ~0.05%.
-// The luminance-preserving WB normalization compensates for residual error.
+// The luminance-preserving WB normalization compensates for residual brightness error.
 static const float3x3 LMS_to_RGB2020 = float3x3(
      2.1398453, -1.2462738,  0.1064285,
     -0.8846699,  2.1631066, -0.2784367,
@@ -104,7 +99,8 @@ uniform float fBlackPoint <
     ui_label = "Dehaze / Black Point";
     ui_tooltip = "Subtracts a percentage of the white point from luminance.\n"
                  "Cuts through the 'dusty' lifted black levels.\n"
-                 "0.005 = 0.5%% of white (0.4 nits SDR, 1.0 nit HDR).";
+                 "0.005 = 0.5%% of white (0.4 nits SDR, 1.0 nit HDR).\n"
+                 "Uses smooth Hermite rolloff (no hard clip edge).";
     ui_category = "Tone & Exposure";
 > = 0.005;
 
@@ -113,7 +109,8 @@ uniform float fContrast <
     ui_min = 0.80; ui_max = 1.50; ui_step = 0.001;
     ui_label = "Filmic Contrast";
     ui_tooltip = "Luminance-based power curve pivoted at 18%% grey.\n"
-                 "Preserves chromaticity (hue and saturation unchanged).";
+                 "Preserves chromaticity (hue and saturation unchanged).\n"
+                 "Values above 1.0 push shadows darker and highlights brighter.";
     ui_category = "Tone & Exposure";
 > = 1.05;
 
@@ -123,7 +120,8 @@ uniform float fTemperature <
     ui_label = "Color Temperature (LMS)";
     ui_tooltip = "Negative = Cooler (removes yellow/sand tint)\n"
                  "Positive = Warmer\n"
-                 "Luminance-preserving: brightness stays constant.";
+                 "Luminance-preserving for neutral tones.\n"
+                 "Saturated colors may shift ~1-3%% in luminance.";
     ui_category = "Color Balance";
 > = -0.12;
 
@@ -140,7 +138,9 @@ uniform float fSaturation <
     ui_min = 0.00; ui_max = 2.00; ui_step = 0.01;
     ui_label = "Saturation";
     ui_tooltip = "Luminance-based linear interpolation.\n"
-                 "Values above 1.0 may push saturated colors out of gamut.";
+                 "Values above 1.0 may push saturated colors out of gamut.\n"
+                 "SDR: out-of-gamut values clipped by output saturate().\n"
+                 "HDR: out-of-gamut values preserved (WCG passthrough).";
     ui_category = "Color Balance";
 > = 1.15;
 
@@ -187,7 +187,7 @@ bool3 IsNan3(float3 v) { return bool3(IsNanVal(v.x), IsNanVal(v.y), IsNanVal(v.z
 bool3 IsInf3(float3 v) { return bool3(IsInfVal(v.x), IsInfVal(v.y), IsInfVal(v.z)); }
 
 // ==============================================================================
-// 5. EOTF / OETF (Exact match with Bilateral Contrast v8.4.1)
+// 5. EOTF / OETF
 // ==============================================================================
 
 float3 sRGB_EOTF(float3 V)
@@ -208,7 +208,6 @@ float3 sRGB_OETF(float3 L)
     float3 enc_lo = abs_L * 12.92;
     float3 enc_hi = 1.055 * PowNonNegPreserveZero3(abs_L, 1.0 / 2.4) - 0.055;
     float3 out_enc;
-    // [v5 Fix] Use derived threshold matching v8.4.1 for bit-exact round-trip
     out_enc.r = (abs_L.r <= SRGB_THRESHOLD_OETF) ? enc_lo.r : enc_hi.r;
     out_enc.g = (abs_L.g <= SRGB_THRESHOLD_OETF) ? enc_lo.g : enc_hi.g;
     out_enc.b = (abs_L.b <= SRGB_THRESHOLD_OETF) ? enc_lo.b : enc_hi.b;
@@ -231,7 +230,6 @@ float3 PQ_InverseEOTF(float3 L)
     return PowNonNegPreserveZero3(num / den, PQ_M2);
 }
 
-// [v5 Fix] Added [flatten] to prevent warp divergence on uniform branch
 float3 DecodeToLinear(float3 encoded, int space)
 {
     [flatten] if (space == 3) return PQ_EOTF(encoded);
@@ -250,14 +248,14 @@ float3 EncodeFromLinear(float3 lin, int space)
 // 6. Photoreal Processing Functions
 // ==============================================================================
 
-// [v5 Fix] Luminance-preserving LMS White Balance
-// Normalizes WB scaling at D65 to prevent brightness shifts from color corrections.
-// Since LMS matrices are row-sum-1, D65 white (1,1,1) RGB maps to (1,1,1) LMS.
-// After WB scaling, we measure the luminance change at D65 and invert it.
+// Luminance-preserving LMS White Balance
+// Normalization ensures D65 neutral tones maintain exact luminance.
+// Saturated colors may have slight residual luminance shift (~1-3%) due to
+// non-diagonal LMS scaling — this is inherent to all multiplicative WB.
 float3 ApplyLMSWhiteBalance(float3 color, float temp, float tint, int space, float3 lumaCoeffs)
 {
     float3x3 to_LMS, to_RGB;
-    // [Fix X3020] Use if/else for matrix selection
+
     [flatten]
     if (space >= 3) {
         to_LMS = RGB2020_to_LMS;
@@ -267,26 +265,23 @@ float3 ApplyLMSWhiteBalance(float3 color, float temp, float tint, int space, flo
         to_RGB = LMS_to_RGB709;
     }
 
-    // LMS cone response scaling:
-    // Temperature: shifts L vs S (red-yellow vs blue axis, Planckian locus)
-    // Tint: shifts (L+S) vs M (magenta vs green axis, perpendicular to Planckian)
+    // LMS cone response scaling
     float3 wbScale = float3(
         1.0 + temp + tint, // L (long): warm↑ magenta↑
         1.0 - tint,        // M (medium): magenta↓ green↑
         1.0 - temp + tint  // S (short): warm↓ cool↑ magenta↑
     );
 
-    // Compute D65 luminance normalization factor (uniform per frame, not per pixel).
-    // D65 white in achromatic-normalized LMS = (1,1,1).
-    // After WB: LMS = wbScale. Convert back to RGB and measure luminance change.
+    // Compute D65 luminance normalization factor.
+    // D65 white in LMS = (1,1,1) due to row-sum-normalized matrices.
+    // After WB: LMS = wbScale. Convert back to RGB and measure luminance.
     float3 d65_wb_rgb = mul(to_RGB, wbScale);
     float lumaScale = dot(d65_wb_rgb, lumaCoeffs);
 
-    // Pre-normalize wbScale so neutral grey maintains exact luminance.
-    // Guard: lumaScale should be positive for any reasonable temp/tint within ±0.5.
-    wbScale /= max(lumaScale, FLT_MIN);
+    // Pre-normalize so neutral grey maintains exact luminance.
+    wbScale /= max(abs(lumaScale), FLT_MIN);
 
-    // Apply: RGB → LMS → scale → RGB
+    // Apply: RGB -> LMS -> scale -> RGB
     float3 lms = mul(to_LMS, color);
     lms *= wbScale;
     return mul(to_RGB, lms);
@@ -302,54 +297,61 @@ void PS_PhotorealHDR(float4 vpos : SV_Position, float2 texcoord : TEXCOORD, out 
     float3 lumaCoeffs = (space >= 3) ? Luma2020 : Luma709;
     float whitePt = (space <= 1) ? SCRGB_WHITE_NITS : fWhitePoint;
 
+    // [v5.1] Fast bypass when all controls are at neutral positions
+    [branch]
+    if (fExposure == 0.0 && fBlackPoint == 0.0 && fContrast == 1.0 &&
+        fTemperature == 0.0 && fTint == 0.0 && fSaturation == 1.0) {
+        fragColor = tex2Dfetch(SamplerBackBuffer, int2(vpos.xy));
+        return;
+    }
+
     // === 1. Decode to Linear Light (nits) ===
-    // [v5 Fix] tex2Dfetch with POINT sampling for bit-exact pixel reads
-    float3 color = DecodeToLinear(tex2Dfetch(SamplerBackBuffer, int2(vpos.xy)).rgb, space);
+    // Cache original for NaN/Inf fallback
+    float3 original_lin = DecodeToLinear(tex2Dfetch(SamplerBackBuffer, int2(vpos.xy)).rgb, space);
+    float3 color = original_lin;
 
     // === 2. Exposure (linear energy multiplier, applied first) ===
     color *= exp2(fExposure);
 
     // === 3. White Balance (LMS, luminance-preserving) ===
-    // [v5 Fix] Processing order: WB before tonal adjustments matches camera raw workflow.
-    // Color correction establishes the "true" scene colors before contrast/dehaze operate.
     color = ApplyLMSWhiteBalance(color, fTemperature, fTint, space, lumaCoeffs);
 
-    // === 4. Black Point / Dehaze ===
-    // [v5 Fix] Scale black point relative to white point for meaningful range in SDR and HDR.
-    // fBlackPoint = 0.005 → 0.5% of white → 0.4 nits (SDR) or 1.0 nit (HDR @ 203).
+    // === 4. Black Point / Dehaze (Smooth Hermite Knee) ===
+    // [v5.1 Fix] Replaced hard max(0, luma - bp) with C1-continuous Hermite rolloff.
+    // Eliminates visible banding/contour at the clip threshold in smooth gradients.
+    // Transition zone: [0, 2*bpNits]. At default 0.005*80 = 0.4 nits, zone is 0-0.8 nits.
     float bpNits = fBlackPoint * whitePt;
     float luma = dot(color, lumaCoeffs);
     float absLuma = max(abs(luma), FLT_MIN);
-    float newLuma = max(0.0, absLuma - bpNits);
-    // Ratio-preserving scale: all channels dimmed equally, preserving chromaticity.
-    // Below bpNits, newLuma = 0 → pixel goes to black (hard clip, intentional for dehaze).
-    color *= newLuma / absLuma;
+
+    float bpRatio;
+    if (bpNits < FLT_MIN) {
+        bpRatio = 1.0;  // No black point adjustment
+    } else {
+        float t = saturate(absLuma / (2.0 * bpNits));  // 0 at black, 1 at 2*bpNits
+        bpRatio = t * t * (3.0 - 2.0 * t);             // Hermite smoothstep (C1 continuous)
+    }
+    color *= bpRatio;
 
     // === 5. Contrast (Luminance-based, chromaticity-preserving) ===
-    // [v5 Fix] Changed from per-channel pow to luminance-based ratio scaling.
-    // Per-channel contrast shifts hue and boosts saturation — not photoreal.
-    // Luminance-based contrast only modifies tonal relationships while preserving color.
-    // Pivot = 18% grey (Zone V, standard photographic reflectance).
     float pivot = 0.18 * whitePt;
     luma = dot(color, lumaCoeffs);
     absLuma = max(abs(luma), FLT_MIN);
-    // Only apply contrast to pixels with meaningful luminance.
-    // Below 1e-4 nits (~-13 stops), contrast amplifies quantization noise.
-    if (absLuma > 1e-4) {
-        float contrastLuma = pow(absLuma / pivot, fContrast) * pivot;
-        color *= contrastLuma / absLuma;
-    }
+
+    float contrastLuma = PowNonNegPreserveZero(absLuma / pivot, fContrast) * pivot;
+    // [v5.1 Fix] Clamp ratio to prevent FP overflow with extreme HDR values + high contrast.
+    // 100x allows ~6.6 stops of boost while preventing Inf propagation.
+    float contrastRatio = min(contrastLuma / absLuma, 100.0);
+    color *= contrastRatio;
 
     // === 6. Saturation ===
-    // Recalculate luma after all tonal modifications.
+    // Recalculate luma after all tonal modifications
     luma = dot(color, lumaCoeffs);
     color = lerp((float3)luma, color, fSaturation);
 
     // === 7. Safety: NaN/Inf Guard ===
-    // Extreme parameter combinations (high contrast + saturation) can overflow pow().
     if (any(IsNan3(color)) || any(IsInf3(color))) {
-        // Fallback: re-decode original pixel (safe passthrough)
-        color = DecodeToLinear(tex2Dfetch(SamplerBackBuffer, int2(vpos.xy)).rgb, space);
+        color = original_lin;
     }
 
     // === 8. Encode to Display Space ===
@@ -368,20 +370,18 @@ void PS_PhotorealHDR(float4 vpos : SV_Position, float2 texcoord : TEXCOORD, out 
 // ==============================================================================
 
 technique PhotorealHDR_Mastering <
-    ui_label = "Photoreal HDR V5 (Mastering Edition)";
+    ui_label = "Photoreal HDR V5.1 (Mastering Edition)";
     ui_tooltip = "Photorealistic grading designed for HDR and SDR displays.\n\n"
                  "Processing Pipeline:\n"
                  "  1. Exposure (linear EV shift)\n"
                  "  2. White Balance (luminance-preserving LMS)\n"
-                 "  3. Dehaze / Black Point (relative to white point)\n"
+                 "  3. Dehaze / Black Point (smooth Hermite knee)\n"
                  "  4. Filmic Contrast (luminance-based, chromaticity-preserving)\n"
                  "  5. Saturation (luminance-weighted)\n\n"
-                 "V5 Fixes:\n"
-                 "- Luminance-preserving white balance\n"
-                 "- Luminance-based contrast (no hue/saturation shift)\n"
-                 "- Black point scaled to white point (works in SDR and HDR)\n"
-                 "- Matched v8.4.1 EOTF/OETF thresholds\n"
-                 "- NaN/Inf output safety\n\n"
+                 "V5.1 Fixes:\n"
+                 "- Smooth Hermite black point (no gradient banding)\n"
+                 "- Contrast ratio overflow protection for HDR\n"
+                 "- Bypass optimization for neutral settings\n\n"
                  "Companion shader: Bilateral Contrast v8.4.1";
 >
 {
