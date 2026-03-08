@@ -4,8 +4,10 @@
 //
 // V5.5 Changes from V5.4:
 // - Fix: Filmic Contrast now preserves signed-luminance behavior
-// - Fix: Perceptual Vibrance now uses the same dark-chroma reliability ramp
-//        concept as Bilateral Contrast to suppress unstable near-black chroma
+// - Fix: Intelligent Saturation with dark-chroma reliability ramp
+//        aligned with Bilateral Contrast v8.4.3+
+// - Fix: More conservative defaults for subtle photoreal starting point
+// - Fix: Early exits in saturation skip Oklab round-trip when unnecessary
 // - Alignment: Companion version strings updated to v8.4.4
 // ============================================================================
 
@@ -125,7 +127,8 @@ uniform float fContrast <
     ui_min = 0.80; ui_max = 1.50; ui_step = 0.001;
     ui_label = "Filmic Contrast";
     ui_tooltip = "Luminance-based power curve pivoted at 18%% grey.\n"
-                 "Preserves chromaticity by applying a scalar ratio to RGB.";
+                 "Preserves chromaticity by applying a scalar ratio to RGB.\n"
+                 "Handles negative-luminance scRGB via absolute value.";
     ui_category = "Tone & Exposure";
 > = 1.03;
 
@@ -153,8 +156,11 @@ uniform float fSaturation <
     ui_type = "slider";
     ui_min = 0.00; ui_max = 2.00; ui_step = 0.01;
     ui_label = "Saturation / Vibrance";
-    ui_tooltip = "Perceptual intelligent saturation.\n"
-                 "Boosts dull colors while protecting already vivid colors.";
+    ui_tooltip = "Intelligent Oklab chroma adjustment.\n"
+                 "Above 1.0: vibrance-style boost (protects already vivid colors).\n"
+                 "Below 1.0: uniform chroma reduction.\n"
+                 "Near-black pixels fade toward neutral (bilateral-aligned reliability).\n"
+                 "Rec.2020 receives gentler boost to avoid gamut boundary clipping.";
     ui_category = "Color Balance";
 > = 1.08;
 
@@ -256,23 +262,15 @@ float3 PQ_InverseEOTF(float3 L)
 
 float3 DecodeToLinear(float3 encoded, int space)
 {
-    [branch]
-    if (space == 3) return PQ_EOTF(encoded);
-
-    [branch]
-    if (space == 2) return encoded * SCRGB_WHITE_NITS;
-
+    [branch] if (space == 3) return PQ_EOTF(encoded);
+    [branch] if (space == 2) return encoded * SCRGB_WHITE_NITS;
     return sRGB_EOTF(encoded) * SCRGB_WHITE_NITS;
 }
 
 float3 EncodeFromLinear(float3 lin, int space)
 {
-    [branch]
-    if (space == 3) return PQ_InverseEOTF(lin);
-
-    [branch]
-    if (space == 2) return lin / SCRGB_WHITE_NITS;
-
+    [branch] if (space == 3) return PQ_InverseEOTF(lin);
+    [branch] if (space == 2) return lin / SCRGB_WHITE_NITS;
     return sRGB_OETF(lin / SCRGB_WHITE_NITS);
 }
 
@@ -280,22 +278,17 @@ float3 EncodeFromLinear(float3 lin, int space)
 // 6. Color Processing
 // ==============================================================================
 
-// Direct ratio form avoids luma² underflow for extremely small values.
+// Direct ratio form avoids luma-squared underflow for extremely small values.
 // Parabolic toe is C1-continuous with the linear subtraction region at luma = 2*bpNits.
 float ComputeBlackPointRatio(float luma, float bpNits)
 {
     if (bpNits <= FLT_MIN || luma <= FLT_MIN)
         return 1.0;
 
-    if (luma < 2.0 * bpNits)
-    {
-        // Parabolic toe: ratio rises linearly from 0 at luma=0 to 0.5 at luma=2*bpNits.
-        // Equivalent to newLuma = luma²/(4*bpNits), ratio = newLuma/luma.
-        // Direct form avoids luma*luma underflow for luma < sqrt(FLT_MIN) ≈ 1.08e-19.
+    if (luma < 2.0 * bpNits) {
         return luma / (4.0 * bpNits);
     }
 
-    // Linear subtraction: removes constant haze offset from entire luminance range.
     return (luma - bpNits) / luma;
 }
 
@@ -313,11 +306,11 @@ float3 ApplyLMSWhiteBalance(float3 color, float temp, float tint, int space, flo
     }
 
     // Exponential cone response: always positive, no channel collapse at extremes.
-    // 0.35 maps ±0.5 slider to ±0.175 stops.
+    // 0.35 maps +/-0.5 slider to +/-0.175 stops — gentle, camera-like response.
     float3 wbStops = 0.35 * float3(
-         temp + tint,   // L (long): warm↑ magenta↑
-        -tint,          // M (medium): magenta↓ green↑
-        -temp + tint    // S (short): warm↓ cool↑ magenta↑
+         temp + tint,
+        -tint,
+        -temp + tint
     );
 
     float3 wbScale = exp2(wbStops);
@@ -332,14 +325,35 @@ float3 ApplyLMSWhiteBalance(float3 color, float temp, float tint, int space, flo
     return mul(to_RGB, lms);
 }
 
+// Intelligent saturation: RGB-based vivid protection + Oklab chroma modification.
+// Protection metric uses RGB channel spread (fast, numerically stable).
+// Actual chroma scaling uses Oklab (perceptually uniform, hue-preserving).
+// Dark-chroma reliability aligned with Bilateral Contrast v8.4.3+.
+//
+// Early exits skip the Oklab round-trip when:
+//   1. Slider is at neutral (1.0)
+//   2. Chroma reliability is zero (near-black pixel)
+//   3. Effective chroma gain collapses to neutral after reliability fade
 float3 ApplyIntelligentSaturation(float3 color, float saturation, int space, float3 lumaCoeffs)
 {
+    // Exit 1: Slider at neutral
     if (abs(saturation - 1.0) < 1e-6)
         return color;
 
     float luma = dot(color, lumaCoeffs);
 
-    // Stable protection metric in native RGB space
+    // Dark-chroma reliability: fade chroma changes in unstable near-black regions.
+    // Negative luma -> reliability = 0 -> bypass (correct for out-of-gamut scRGB).
+    float ct = saturate((luma - CHROMA_RELIABILITY_START) * INV_CHROMA_RELIABILITY_SPAN);
+    float chroma_reliability = ct * ct * (3.0 - 2.0 * ct);
+
+    // Exit 2: Near-black pixel — chroma is numerically unstable
+    if (chroma_reliability <= 0.0)
+        return color;
+
+    // Vivid-color protection metric from RGB channel spread.
+    // peak uses abs() to handle scRGB negatives as denominator;
+    // max_c/min_c use signed values so (max_c - min_c) measures true channel spread.
     float peak = max(abs(color.r), max(abs(color.g), abs(color.b)));
     float max_c = max(color.r, max(color.g, color.b));
     float min_c = min(color.r, min(color.g, color.b));
@@ -348,25 +362,34 @@ float3 ApplyIntelligentSaturation(float3 color, float saturation, int space, flo
     if (peak > 1e-6)
         sat_current = saturate((max_c - min_c) / peak);
 
+    // Smoothstep makes protection onset gradual rather than linear
     float protection = sat_current * sat_current * (3.0 - 2.0 * sat_current);
 
     float chroma_gain = saturation;
 
-    // Wider gamut needs a slightly gentler boost
     if (saturation > 1.0)
     {
         float boost = saturation - 1.0;
+        // Wider gamut (Rec.2020) gets gentler boost to avoid gamut boundary clipping.
         float space_comp = (space >= 3) ? 0.90 : 1.0;
+        // At maximum protection (fully vivid color), a residual fraction of
+        // the boost still applies. This prevents a hard "wall" where colors
+        // just below the protection threshold get boosted but those above don't.
+        // Rec.2020: 20% residual (wider gamut, closer to clipping).
+        // Rec.709:  25% residual (tighter gamut, more headroom).
         float min_boost_share = (space >= 3) ? 0.20 : 0.25;
 
         chroma_gain = 1.0 + boost * space_comp * lerp(1.0, min_boost_share, protection);
     }
 
-    // Fade chroma changes in unstable near-black regions
-    float ct = saturate((luma - CHROMA_RELIABILITY_START) * INV_CHROMA_RELIABILITY_SPAN);
-    float chroma_reliability = ct * ct * (3.0 - 2.0 * ct);
+    // Apply dark-chroma reliability: unreliable pixels fade to identity (gain=1.0)
     chroma_gain = lerp(1.0, chroma_gain, chroma_reliability);
 
+    // Exit 3: Effective gain collapsed to neutral (e.g., vivid color at low reliability)
+    if (abs(chroma_gain - 1.0) < 1e-6)
+        return color;
+
+    // Oklab round-trip for perceptually uniform chroma modification
     float3x3 to_LMS, to_RGB;
 
     [branch]
@@ -433,24 +456,26 @@ void PS_PhotorealHDR(float4 vpos : SV_Position, float2 texcoord : TEXCOORD, out 
         }
     }
 
-// 4. Filmic Contrast (signed-luminance safe)
-if (abs(fContrast - 1.0) > 1e-6)
-{
-    float luma = dot(color, lumaCoeffs);
-    float absLuma = abs(luma);
-
-    // Skip true-black / near-zero luminance to avoid ratio explosion
-    // when fContrast < 1.0.
-    if (absLuma > FLT_MIN)
+    // 4. Filmic Contrast (signed-luminance safe)
+    // Uses abs(luma) so negative-luminance scRGB pixels get the same contrast
+    // ratio as their absolute value, preserving WCG channel signs.
+    // Zero-luminance guard prevents ratio explosion at sub-FLT_MIN values
+    // when fContrast < 1.0 (pow amplifies tiny bases with fractional exponents).
+    if (abs(fContrast - 1.0) > 1e-6)
     {
-        float pivot = 0.18 * whitePt;
-        float contrastLuma = PowNonNegPreserveZero(absLuma / pivot, fContrast) * pivot;
-        float contrastRatio = min(contrastLuma / absLuma, 100.0);
-        color *= contrastRatio;
-    }
-}
+        float luma = dot(color, lumaCoeffs);
+        float absLuma = abs(luma);
 
-    // 5. Perceptual Vibrance
+        if (absLuma > FLT_MIN)
+        {
+            float pivot = 0.18 * whitePt;
+            float contrastLuma = PowNonNegPreserveZero(absLuma / pivot, fContrast) * pivot;
+            float contrastRatio = min(contrastLuma / absLuma, 100.0);
+            color *= contrastRatio;
+        }
+    }
+
+    // 5. Intelligent Saturation
     color = ApplyIntelligentSaturation(color, fSaturation, space, lumaCoeffs);
 
     // Safety
@@ -479,11 +504,13 @@ technique PhotorealHDR_Mastering <
                  "  2. LMS White Balance (exponential, luminance-preserving)\n"
                  "  3. Subtractive Black Point (C1 parabolic toe)\n"
                  "  4. Filmic Contrast (signed-luminance safe)\n"
-                 "  5. Oklab Perceptual Vibrance with dark-chroma reliability fade\n\n"
+                 "  5. Intelligent Saturation (Oklab chroma, dark reliability fade)\n\n"
                  "V5.5 Fixes:\n"
-                 "- Fix: Signed-luminance contrast behavior restored\n"
-                 "- Fix: Vibrance fades out in unstable near-black regions\n"
-                 "- Alignment: Companion version updated to Bilateral Contrast v8.4.4";
+                 "- Fix: Signed-luminance contrast with zero-guard\n"
+                 "- Fix: Saturation dark-chroma reliability aligned with bilateral\n"
+                 "- Fix: Gamut-width-aware boost compensation (Rec.2020 gentler)\n"
+                 "- Fix: Early exits skip Oklab round-trip when unnecessary\n\n"
+                 "Companion shader: Bilateral Contrast v8.4.4";
 >
 {
     pass
