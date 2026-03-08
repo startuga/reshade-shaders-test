@@ -223,14 +223,14 @@ uniform float fStrength <
     ui_label = "Contrast Strength";
     ui_min = 0.0; ui_max = 5.0; ui_step = 0.001;
     ui_category = "Core Settings";
-> = 2.5;
+> = 3.0;
 
 uniform float fShadowProtection <
     ui_type = "slider";
     ui_label = "Shadow Protection";
     ui_min = 0.0; ui_max = 1.0; ui_step = 0.001;
     ui_category = "Protection Zones";
-> = 0;
+> = 0.15;
 
 uniform float fMidtoneProtection <
     ui_type = "slider";
@@ -244,7 +244,7 @@ uniform float fHighlightProtection <
     ui_label = "Highlight Protection";
     ui_min = 0.0; ui_max = 1.0; ui_step = 0.001;
     ui_category = "Protection Zones";
-> = 0;
+> = 0.10;
 
 uniform float fZoneWhitePoint <
     ui_type = "slider";
@@ -280,14 +280,14 @@ uniform float fAdaptiveAmount <
     ui_label = "Adaptive Amount";
     ui_min = 0.0; ui_max = 1.0; ui_step = 0.001;
     ui_category = "Adaptive Processing";
-> = 0.25;
+> = 0.35;
 
 uniform float fAdaptiveCurve <
     ui_type = "slider";
     ui_label = "Adaptive Curve";
     ui_min = 0.1; ui_max = 4.0; ui_step = 0.01;
     ui_category = "Adaptive Processing";
-> = 1.25;
+> = 1.50;
 
 uniform int iRadius <
     ui_type = "slider";
@@ -301,14 +301,14 @@ uniform float fSigmaSpatial <
     ui_label = "Spatial Sigma";
     ui_min = 0.1; ui_max = 32.0; ui_step = 0.01;
     ui_category = "Filter Parameters";
-> = 4;
+> = 3.0;
 
 uniform float fSigmaRange <
     ui_type = "slider";
     ui_label = "Range Sigma (Stops)";
     ui_min = 0.01; ui_max = 4.0; ui_step = 0.001;
     ui_category = "Filter Parameters";
-> = 0.35;
+> = 0.45;
 
 uniform float fSigmaChroma <
     ui_type = "slider";
@@ -317,7 +317,7 @@ uniform float fSigmaChroma <
     ui_tooltip = "Controls filter sensitivity to Oklab chromaticity differences.\n"
                  "Typical perceptible shift: 0.05-0.15 in (a/L, b/L) space.";
     ui_category = "Filter Parameters";
-> = 0.15;
+> = 0.12;
 
 uniform bool bChromaAwareBilateral <
     ui_label = "Chroma-Aware Filtering";
@@ -334,7 +334,7 @@ uniform float fAdaptiveRadiusStrength <
     ui_label = "Adaptive Radius Strength";
     ui_min = 0.0; ui_max = 1.0; ui_step = 0.01;
     ui_category = "Adaptive Radius";
-> = 0.7;
+> = 0.80;
 
 uniform float fChromaEdgeStrength <
     ui_type = "slider";
@@ -343,7 +343,7 @@ uniform float fChromaEdgeStrength <
     ui_tooltip = "Controls how strongly chroma edges reduce the filter radius.\n"
                  "0.0 = Luma only. 1.0 = Max(Luma, Oklab Chroma).";
     ui_category = "Adaptive Radius";
-> = 0.5;
+> = 0.60;
 
 uniform int iEdgeDetectionMethod <
     ui_type = "combo";
@@ -357,7 +357,7 @@ uniform float fGradientSensitivity <
     ui_label = "Gradient Sensitivity";
     ui_min = 10.0; ui_max = 500.0; ui_step = 1.0;
     ui_category = "Advanced Tuning";
-> = 150.0;
+> = 200.0;
 
 uniform float fVarianceWeight <
     ui_type = "slider";
