@@ -9,7 +9,7 @@
  * - True Stop-Domain HDR Processing
  * - Oklab Perceptual Chromaticity Processing
  *
- * Version: 8.4.3 (Chroma Reliability Alignment)
+ * Version: 8.4.4 (Chroma Reliability Alignment)
  * - Fix: Bilateral chroma reliability smoothstep inlined in the hot loop
  * - Fix: Pre-pass, ChromaEdge, and bilateral chroma weighting now share the same reliability ramp
  * - Fix: Loop-invariant chroma branch hoisted via use_chroma
@@ -1064,15 +1064,17 @@ float3 ProcessPixel(int2 center_pos)
 
 void PS_BilateralContrast(float4 vpos : SV_Position, out float4 fragColor : SV_Target)
 {
+    int2 pos = int2(vpos.xy);
+
     [branch]
     if (fStrength <= 0.0 && iDebugMode == 0) {
-        fragColor = tex2Dfetch(SamplerBackBuffer, int2(vpos.xy));
+        fragColor = tex2Dfetch(SamplerBackBuffer, pos);
         return;
     }
 
-    float3 result = ProcessPixel(int2(vpos.xy));
+    float3 result = ProcessPixel(pos);
 
-        [branch]
+    [branch]
     if (iDebugMode != 0) {
         float3 encoded = EncodeFromLinear(max(result, 0.0) * GetResolvedWhitePoint());
         if (((iColorSpaceOverride > 0) ? iColorSpaceOverride : BUFFER_COLOR_SPACE) <= 1)
@@ -1080,26 +1082,22 @@ void PS_BilateralContrast(float4 vpos : SV_Position, out float4 fragColor : SV_T
         fragColor = float4(encoded, 1.0);
         return;
     }
-    
+
     float3 encoded = EncodeFromLinear(result);
 
     int activeSpace = (iColorSpaceOverride > 0) ? iColorSpaceOverride : BUFFER_COLOR_SPACE;
-
     [flatten]
-    if (activeSpace <= 1) {
-        encoded = saturate(encoded);
-    }
+    if (activeSpace <= 1) encoded = saturate(encoded);
 
     [branch]
-    if (bQuantize10Bit) {
+    if (bQuantize10Bit)
         encoded = round(max(encoded, 0.0) * 1023.0) / 1023.0;
-    }
 
     fragColor = float4(encoded, 1.0);
 }
 
 technique BilateralContrast_Reference <
-    ui_label = "Bilateral Contrast v8.4.3 (Mastering Edition)";
+    ui_label = "Bilateral Contrast v8.4.4 (Mastering Edition)";
     ui_tooltip = "MASTERING QUALITY - True Math Processing\n\n"
                  "v8.4.3 Fixes:\n"
                  "- Fix: Bilateral chroma reliability smoothstep inlined in hot loop\n"
@@ -1132,3 +1130,4 @@ technique BilateralContrast_Reference <
         PixelShader  = PS_BilateralContrast;
     }
 }
+
