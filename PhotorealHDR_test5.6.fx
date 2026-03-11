@@ -350,6 +350,7 @@ float3 ApplyLMSWhiteBalance(float3 color, float temp, float tint, float3 lumaCoe
 //   1. Slider is at neutral (1.0)
 //   2. Chroma reliability is zero (near-black pixel)
 //   3. Effective chroma gain collapses to neutral after reliability fade
+// `space` is needed here (unlike WB) for gamut-specific protection tuning (e.g., Rec.2020)
 float3 ApplyIntelligentSaturation(float3 color, float saturation, int space, float3 lumaCoeffs, float3x3 to_LMS, float3x3 to_RGB)
 {
     // Exit 1: Slider at neutral
@@ -561,8 +562,9 @@ void PS_PhotorealHDR(float4 vpos : SV_Position, float2 texcoord : TEXCOORD, out 
     float3 encoded = EncodeFromLinear(color, space);
 
     // Hardware safety: SDR must strictly output [0, 1].
-    // If Khronos is enabled, this is a mathematically safe pass-through.
-    // If Khronos is disabled (or extreme values break it), this acts as the final hard-clip.
+    // When Khronos is enabled, the Fresnel toe offset re-addition can push
+    // peak values up to ~1.04, so this clamp performs a small, expected final clip.
+    // Without Khronos, this is the only protection against out-of-range values.
     [flatten]
     if (space <= 1)
         encoded = saturate(encoded);

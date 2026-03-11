@@ -477,8 +477,8 @@ float3 sRGB_OETF(float3 L)
 
 float3 PQ_EOTF(float3 N)
 {
-    float3 N_safe = max(N, 0.0);
-    float3 Np = PowNonNegPreserveZero3(N_safe, 1.0 / PQ_M2);
+    N = saturate(N); // Guard against upstream out-of-bounds
+    float3 Np = PowNonNegPreserveZero3(N, 1.0 / PQ_M2);
     float3 num = max(Np - PQ_C1, 0.0);
     float3 den = max(PQ_C2 - PQ_C3 * Np, FLT_MIN);
     return PowNonNegPreserveZero3(num / den, 1.0 / PQ_M1) * PQ_PEAK_LUMINANCE;
@@ -486,11 +486,11 @@ float3 PQ_EOTF(float3 N)
 
 float3 PQ_InverseEOTF(float3 L)
 {
-    float3 L_safe = max(L, 0.0) / PQ_PEAK_LUMINANCE;
-    float3 Lp = PowNonNegPreserveZero3(L_safe, PQ_M1);
+    L = clamp(L, 0.0, PQ_PEAK_LUMINANCE); // Clamp to maximum ST.2084 limit
+    float3 Lp = PowNonNegPreserveZero3(L / PQ_PEAK_LUMINANCE, PQ_M1);
     float3 num = PQ_C1 + PQ_C2 * Lp;
     float3 den = 1.0 + PQ_C3 * Lp;
-    return PowNonNegPreserveZero3(num / den, PQ_M2);
+    return saturate(PowNonNegPreserveZero3(num / den, PQ_M2));
 }
 
 // Uniform-dependent branch keeps unselected transfer functions cold.
@@ -1065,10 +1065,11 @@ float3 ProcessPixel(int2 center_pos)
 void PS_BilateralContrast(float4 vpos : SV_Position, out float4 fragColor : SV_Target)
 {
     int2 pos = int2(vpos.xy);
+    float4 src = tex2Dfetch(SamplerBackBuffer, pos); // Fetch full pixel including alpha
 
     [branch]
     if (fStrength <= 0.0 && iDebugMode == 0) {
-        fragColor = tex2Dfetch(SamplerBackBuffer, pos);
+        fragColor = src; // Pass-through preserves alpha
         return;
     }
 
@@ -1079,7 +1080,7 @@ void PS_BilateralContrast(float4 vpos : SV_Position, out float4 fragColor : SV_T
         float3 encoded = EncodeFromLinear(max(result, 0.0) * GetResolvedWhitePoint());
         if (((iColorSpaceOverride > 0) ? iColorSpaceOverride : BUFFER_COLOR_SPACE) <= 1)
             encoded = saturate(encoded);
-        fragColor = float4(encoded, 1.0);
+        fragColor = float4(encoded, src.a); // Preserve alpha in debug modes
         return;
     }
 
@@ -1093,7 +1094,7 @@ void PS_BilateralContrast(float4 vpos : SV_Position, out float4 fragColor : SV_T
     if (bQuantize10Bit)
         encoded = round(max(encoded, 0.0) * 1023.0) / 1023.0;
 
-    fragColor = float4(encoded, 1.0);
+    fragColor = float4(encoded, src.a); // Preserve alpha in final output
 }
 
 technique BilateralContrast_Reference <
