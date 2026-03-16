@@ -1,5 +1,5 @@
 // ============================================================================
-// Photoreal HDR Color Grader (V5.6 - Mastering Edition)
+// Photoreal HDR Color Grader (V5.7 - Mastering Edition)
 // Companion shader to Bilateral Contrast v8.4.4
 //
 // V5.6 Changes from V5.4:
@@ -190,6 +190,21 @@ uniform float fCompressionStart <
                  "0.80 = 1:1 color mapping up to 80% of peak display brightness.";
     ui_category = "Tone Mapping";
 > = 0.80;
+
+uniform float fDesaturationStrength <
+    ui_type = "slider";
+    ui_min = 0.00; ui_max = 0.50; ui_step = 0.01;
+    ui_label = "Highlight Desaturation";
+    ui_tooltip = "Physical desaturation near display peak.\n"
+                 "0.00 = Pure chromaticity preservation (no desaturation).\n"
+                 "0.15 = Khronos PBR Neutral reference default.\n"
+                 "Higher values simulate emitter saturation roll-off.\n\n"
+                 "The original Khronos formula over-desaturates in HDR because\n"
+                 "it scales with absolute input intensity. This version bounds\n"
+                 "desaturation to the compression-progress ratio, so maximum\n"
+                 "desaturation equals this value regardless of input brightness.";
+    ui_category = "Tone Mapping";
+> = 0.15;
 
 uniform int iColorSpaceOverride <
     ui_type = "combo";
@@ -444,12 +459,26 @@ float3 ApplyKhronosPBRNeutral(float3 color, float targetPeak, float compressionS
         
         safeColor *= newPeak / max(peak, FLT_MIN);
 
-        // 3. Physical Desaturation
-        float desatRate = 0.15 / targetPeak;
-        float g = 1.0 - 1.0 / (desatRate * (peak - newPeak) + 1.0);
+        // 3. HDR-aware Physical Desaturation
+        //
+        // ORIGINAL (V5.6):
+        //   g = 1 - 1 / ((0.15/targetPeak) * (peak - newPeak) + 1)
+        //   Problem: (peak - newPeak) grows unboundedly with input intensity.
+        //   3000 nits on an 800-nit display → g ≈ 29%.
+        //   10000 nits → g ≈ 63%. Far exceeds physical motivation.
+        //
+        // FIX (V5.7):
+        //   Drive desaturation by compression progress t = (newPeak - startComp) / d.
+        //   t is bounded [0, 1) regardless of how extreme the input is:
+        //     - t = 0 at compression onset (peak == startComp)
+        //     - t → 1 as peak → ∞ (newPeak → targetPeak)
+        //   Quadratic onset (t²) keeps desaturation gentle until close to
+        //   the display ceiling, matching the physical model of emitter
+        //   saturation roll-off occurring only in the top few percent.
+        //   Maximum desaturation = fDesaturationStrength (user-controlled).
+        float t = saturate((newPeak - startComp) / max(d, FLT_MIN));
+        float g = fDesaturationStrength * t * t;
         
-        // Note: The reference Khronos re-adds the offset at the end.
-        // At full desaturation (g -> 1), this outputs newPeak.xxx + offset.
         safeColor = lerp(safeColor, newPeak.xxx, g);
         return safeColor + offset;
     }
@@ -578,7 +607,7 @@ void PS_PhotorealHDR(float4 vpos : SV_Position, float2 texcoord : TEXCOORD, out 
 // ==============================================================================
 
 technique PhotorealHDR_Mastering <
-    ui_label = "Photoreal HDR V5.6 (Mastering Edition)";
+    ui_label = "Photoreal HDR V5.7 (Mastering Edition)";
     ui_tooltip = "Photorealistic grading for SDR and HDR.\n\n"
                  "Pipeline:\n"
                  "  1. Exposure (linear EV shift)\n"
