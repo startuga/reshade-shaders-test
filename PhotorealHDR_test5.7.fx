@@ -2,6 +2,13 @@
 // Photoreal HDR Color Grader (V5.7 - Mastering Edition)
 // Companion shader to Bilateral Contrast v8.4.4
 //
+// V5.7 Changes from V5.6:
+// - Fix: Pipeline reorder — Saturation now runs AFTER Khronos tonemapping
+//        so the tonemapper's highlight desaturation no longer overrides
+//        creative saturation choices. Saturation is now display-referred.
+// - Fix: Khronos desaturation uses bounded compression-progress metric
+//        instead of unbounded (peak - newPeak) to prevent excessive
+//        highlight desaturation in HDR (V5.6 issue).
 // V5.6 Changes from V5.4:
 // - add: Khronos PBR Neutral (Hue-preserving highlight compression)
 // V5.5 Changes from V5.4:
@@ -561,10 +568,9 @@ void PS_PhotorealHDR(float4 vpos : SV_Position, float2 texcoord : TEXCOORD, out 
         }
     }
 
-    // 5. Intelligent Saturation
-    color = ApplyIntelligentSaturation(color, fSaturation, space, lumaCoeffs, to_LMS, to_RGB);
-
-    // 6. Khronos PBR Neutral Tone Mapping
+    // 5. Khronos PBR Neutral Tone Mapping
+    //    (Moved BEFORE saturation so the tonemapper's highlight desaturation
+    //     doesn't override the user's creative saturation choices.)
     [branch]
     if (bEnableKhronosNeutral)
     {
@@ -582,6 +588,17 @@ void PS_PhotorealHDR(float4 vpos : SV_Position, float2 texcoord : TEXCOORD, out 
         // UN-NORMALIZE: Scale back to working linear space (Nits)
         color *= whitePt;
     }
+
+    // 6. Intelligent Saturation (Display-Referred)
+    //    Now operates on tonemapped values, giving the user direct control
+    //    over the final display appearance. The tonemapper's physical
+    //    desaturation no longer fights the saturation slider.
+    //    
+    //    Post-tonemap benefits:
+    //    - Values are bounded, so Oklab round-trip is more stable
+    //    - Vivid-color protection prevents exceeding compressed peak
+    //    - What you set is what you see (no downstream modification)
+    color = ApplyIntelligentSaturation(color, fSaturation, space, lumaCoeffs, to_LMS, to_RGB);
 
     // Safety
     if (any(IsNan3(color)) || any(IsInf3(color)))
@@ -614,8 +631,8 @@ technique PhotorealHDR_Mastering <
                  "  2. LMS White Balance (exponential)\n"
                  "  3. Subtractive Black Point (C1 parabolic toe)\n"
                  "  4. Filmic Contrast (signed-luminance safe)\n"
-                 "  5. Intelligent Saturation (Oklab chroma)\n"
-                 "  6. Khronos PBR Neutral (Hue-preserving highlight compression)\n\n"
+                 "  5. Khronos PBR Neutral (Hue-preserving highlight compression)\n"
+                 "  6. Intelligent Saturation (display-referred Oklab chroma)\n\n"
                  "Companion shader: Bilateral Contrast v8.4.4";
 >
 {
