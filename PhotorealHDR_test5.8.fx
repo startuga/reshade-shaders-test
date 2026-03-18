@@ -1,7 +1,16 @@
 // ============================================================================
-// Photoreal HDR Color Grader (V5.7 - Mastering Edition)
+// Photoreal HDR Color Grader (V5.8 - Mastering Edition)
 // Companion shader to Bilateral Contrast v8.4.4
 //
+// V5.8 Changes from V5.7:
+// - Fix: Khronos compression now ratio-preserves negative scRGB channels.
+//        Previously, max(color, 0.0) destroyed WCG excursions at the gate.
+//        Now, compression ratio is computed from clamped peak but applied
+//        uniformly to original channels. Negatives scale proportionally
+//        through compression and only fade during desaturation.
+//        Set Highlight Desaturation to 0 for full WCG preservation.
+// - Fix: Decode sanitization catches NaN/Inf from corrupt upstream buffers.
+// - Fix: Fast bypass uses epsilon comparisons for preset serialization safety.
 // V5.7 Changes from V5.6:
 // - Fix: Pipeline reorder — Saturation now runs AFTER Khronos tonemapping
 //        so the tonemapper's highlight desaturation no longer overrides
@@ -446,56 +455,45 @@ float3 ApplyIntelligentSaturation(float3 color, float saturation, int space, flo
 // ==============================================================================
 float3 ApplyKhronosPBRNeutral(float3 color, float targetPeak, float compressionStart)
 {
-    // Guard against negative scRGB out-of-gamut values breaking the parabola.
+    // Compute toe offset from clamped channels (safe math for the parabola).
+    // When ANY channel is negative, min(safeColor) = 0, so offset = 0.
+    // This correctly disables the Fresnel toe for out-of-gamut pixels.
     float3 safeColor = max(color, 0.0);
-    
-    // 1. Fresnel Toe (Expects color to be normalized where 1.0 = Diffuse White)
     float x = min(safeColor.r, min(safeColor.g, safeColor.b));
     float offset = x < 0.08 ? x - 6.25 * x * x : 0.04;
-    safeColor -= offset;
-
-    float peak = max(safeColor.r, max(safeColor.g, safeColor.b));
+    
+    // Peak from clamped-and-toed channels drives the compression decision.
+    // max(a-c, b-c, d-c) = max(a,b,d) - c, so this equals the original formulation.
+    float peak = max(safeColor.r, max(safeColor.g, safeColor.b)) - offset;
     float startComp = (targetPeak * compressionStart) - 0.04;
     
     [branch]
     if (peak >= startComp && startComp > 0.0)
     {
-        // 2. Parameterized 'P' Rational Compression Curve
+        // 1. Rational Compression Curve (unchanged math)
         float d = targetPeak - startComp;
         float newPeak = targetPeak - (d * d) / (peak + d - startComp);
         
-        safeColor *= newPeak / max(peak, FLT_MIN);
-
-        // 3. HDR-aware Physical Desaturation
-        //
-        // ORIGINAL (V5.6):
-        //   g = 1 - 1 / ((0.15/targetPeak) * (peak - newPeak) + 1)
-        //   Problem: (peak - newPeak) grows unboundedly with input intensity.
-        //   3000 nits on an 800-nit display → g ≈ 29%.
-        //   10000 nits → g ≈ 63%. Far exceeds physical motivation.
-        //
-        // FIX (V5.7):
-        //   Drive desaturation by compression progress t = (newPeak - startComp) / d.
-        //   t is bounded [0, 1) regardless of how extreme the input is:
-        //     - t = 0 at compression onset (peak == startComp)
-        //     - t → 1 as peak → ∞ (newPeak → targetPeak)
-        //   Quadratic onset (t²) keeps desaturation gentle until close to
-        //   the display ceiling, matching the physical model of emitter
-        //   saturation roll-off occurring only in the top few percent.
-        //   Maximum desaturation = fDesaturationStrength (user-controlled).
+        // 2. Apply toe + uniform ratio to ORIGINAL color.
+        //    ratio = newPeak/peak < 1.0 always (compression), so negative
+        //    channels reduce in magnitude — no amplification of out-of-gamut.
+        float3 working = color - offset;
+        float ratio = newPeak / max(peak, FLT_MIN);
+        working *= ratio;
+        
+        // 3. Bounded Physical Desaturation (V5.7 fix).
+        //    For negative channels, lerp toward positive newPeak pulls them
+        //    toward neutral — physically correct for display rendering.
+        //    With fDesaturationStrength = 0, negatives survive completely.
         float t = saturate((newPeak - startComp) / max(d, FLT_MIN));
         float g = fDesaturationStrength * t * t;
+        working = lerp(working, newPeak.xxx, g);
         
-        safeColor = lerp(safeColor, newPeak.xxx, g);
-        return safeColor + offset;
+        return working + offset;
     }
-
-    // ARCHITECTURAL DEVIATION FROM REFERENCE:
-    // The reference subtracts the offset, clamps negatives, and re-adds the offset.
-    // By returning the raw `color` here, we deliberately bypass the `max(color, 0.0)` 
-    // clamp for the 1:1 mapped region. This perfectly preserves negative scRGB values 
-    // (Wide Color Gamut data) that standard Khronos would otherwise permanently crush.
-    return color; 
+    
+    // 1:1 region: bypass preserves negative scRGB exactly (unchanged).
+    return color;
 }
 
 // ==============================================================================
@@ -510,16 +508,29 @@ void PS_PhotorealHDR(float4 vpos : SV_Position, float2 texcoord : TEXCOORD, out 
     float3 lumaCoeffs = (space >= 3) ? Luma2020 : Luma709;
     float whitePt = (space <= 1) ? SCRGB_WHITE_NITS : fWhitePoint;
 
-    // Fast bypass: preserves upstream alpha
+    // Fast bypass: preserves upstream alpha.
+    // Epsilon comparisons guard against preset serialization residuals
+    // where a "zero" slider might deserialize as 1e-9.
     [branch]
-    if (fExposure == 0.0 && fBlackPoint == 0.0 && fContrast == 1.0 &&
-        fTemperature == 0.0 && fTint == 0.0 && fSaturation == 1.0 && !bEnableKhronosNeutral) {
+    if (abs(fExposure) < 1e-6 &&
+        abs(fBlackPoint) < 1e-6 &&
+        abs(fContrast - 1.0) < 1e-6 &&
+        abs(fTemperature) < 1e-6 &&
+        abs(fTint) < 1e-6 &&
+        abs(fSaturation - 1.0) < 1e-6 &&
+        !bEnableKhronosNeutral) {
         fragColor = src;
         return;
     }
 
     // Cache original for NaN/Inf fallback
     float3 original_lin = DecodeToLinear(src.rgb, space);
+    
+    // Sanitize: if upstream buffer is already corrupt, fall back to black
+    // rather than propagating poison through the entire pipeline.
+    if (any(IsNan3(original_lin)) || any(IsInf3(original_lin)))
+        original_lin = 0.0;
+    
     float3 color = original_lin;
 
     // Matrix setup hoisted out of per-function branches
@@ -624,7 +635,7 @@ void PS_PhotorealHDR(float4 vpos : SV_Position, float2 texcoord : TEXCOORD, out 
 // ==============================================================================
 
 technique PhotorealHDR_Mastering <
-    ui_label = "Photoreal HDR V5.7 (Mastering Edition)";
+    ui_label = "Photoreal HDR V5.8 (Mastering Edition)";
     ui_tooltip = "Photorealistic grading for SDR and HDR.\n\n"
                  "Pipeline:\n"
                  "  1. Exposure (linear EV shift)\n"
