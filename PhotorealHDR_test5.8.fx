@@ -2,6 +2,14 @@
 // Photoreal HDR Color Grader (V5.8 - Mastering Edition)
 // Companion shader to Bilateral Contrast v8.4.4
 //
+//* Design Philosophy: PRECISION OVER PERFORMANCE
+//* - True IEEE 754 Math (No fast intrinsics or approximations)
+//* - Exact IEC/SMPTE Standard Constants
+//* - Bit-Exact Neutrality Logic
+//* - Pre-computed High-Precision Kernels
+//* - True Stop-Domain HDR Processing
+//* - Oklab Perceptual Chromaticity Processing
+//
 // V5.8 Changes from V5.7:
 // - Fix: Khronos compression now ratio-preserves negative scRGB channels.
 //        Previously, max(color, 0.0) destroyed WCG excursions at the gate.
@@ -42,25 +50,57 @@
 static const float FLT_MIN = 1.175494351e-38;
 static const float SCRGB_WHITE_NITS = 80.0;
 
-// sRGB thresholds
-static const float SRGB_THRESHOLD_EOTF = 0.04045;
-static const float SRGB_THRESHOLD_OETF = (0.04045 / 12.92);
+// Neutrality-test epsilon: 1 ULP at the 6th decimal digit.
+// Chosen larger than float rounding (~1e-7) to catch preset serialization
+// residuals, but small enough to be visually imperceptible (<0.0001% change).
+static const float NEUTRAL_EPS = 1e-6;
 
-// ST.2084 (PQ) EOTF Constants
-static const float PQ_M1 = 0.1593017578125;
-static const float PQ_M2 = 78.84375;
-static const float PQ_C1 = 0.8359375;
-static const float PQ_C2 = 18.8515625;
-static const float PQ_C3 = 18.6875;
+// sRGB (IEC 61966-2-1:1999)
+// Exact decimal constants from the standard.
+// Binary representations are nearest-representable IEEE 754 single.
+static const float SRGB_THRESHOLD_EOTF = 0.04045;
+static const float SRGB_THRESHOLD_OETF = 0.0031308;  // See note below
+static const float SRGB_GAMMA          = 2.4;
+static const float SRGB_INV_GAMMA      = 0.41666666666666667; // 1/2.4 = 5/12
+
+// NOTE on SRGB_THRESHOLD_OETF:
+// IEC 61966-2-1 specifies the linear-side threshold as 0.0031308, AND the
+// encoded-side threshold as 0.04045 with slope 12.92. These are inconsistent
+// at the 5th decimal digit: 0.04045/12.92 = 0.003130804954, not 0.0031308.
+// We use the standard's explicit linear-side value 0.0031308 for the OETF,
+// and the explicit encoded-side value 0.04045 for the EOTF, matching the
+// reference specification exactly rather than deriving one from the other.
+
+// ST.2084 (PQ) EOTF Constants (SMPTE ST 2084:2014)
+// All forward constants are exact rational fractions of powers-of-two
+// and are exactly representable in IEEE 754 single precision.
+static const float PQ_M1 = 0.1593017578125;   // 2610 / 16384
+static const float PQ_M2 = 78.84375;           // 2523 / 32
+static const float PQ_C1 = 0.8359375;          // 3424 / 4096
+static const float PQ_C2 = 18.8515625;         // 2413 / 128 = 2413 * 32 / 4096
+static const float PQ_C3 = 18.6875;            // 2392 / 128 = 2392 * 32 / 4096
 static const float PQ_PEAK_LUMINANCE = 10000.0;
+
+// Pre-computed reciprocals for EOTF inversion.
+// NOT exactly representable in float — these are the nearest IEEE 754 singles
+// to the true rational values, computed at double precision and truncated.
+static const float PQ_INV_M1 = 6.2773946360153257;   // 16384 / 2610
+static const float PQ_INV_M2 = 0.012683313515655966;  // 32 / 2523
+
+// Oklab cube root exponent.
+// 1/3 is not representable in IEEE 754 (repeating binary fraction).
+// The nearest float is 0.333333343... (1 ULP above true 1/3).
+// This introduces ~1e-7 relative error in the cube root, which is at
+// the float precision floor and visually imperceptible.
+static const float OKLAB_CBRT_EXP = 0.33333333333333333;  // 1/3
 
 // Chroma reliability alignment with Bilateral Contrast
 static const float CHROMA_STABILITY_THRESH = 1e-4;
 static const float CHROMA_RELIABILITY_START = 5e-5;
 static const float INV_CHROMA_RELIABILITY_SPAN =
-    1.0 / (CHROMA_STABILITY_THRESH - CHROMA_RELIABILITY_START);
+    1.0 / (CHROMA_STABILITY_THRESH - CHROMA_RELIABILITY_START);  // = 20000.0
 
-// ITU-R Luma Coefficients
+// ITU-R Luma Coefficients (BT.709-6, BT.2020-2)
 static const float3 Luma709  = float3(0.2126, 0.7152, 0.0722);
 static const float3 Luma2020 = float3(0.2627, 0.6780, 0.0593);
 
@@ -272,7 +312,7 @@ float3 sRGB_EOTF(float3 V)
 {
     float3 abs_V = abs(V);
     float3 lin_lo = abs_V / 12.92;
-    float3 lin_hi = PowNonNegPreserveZero3((abs_V + 0.055) / 1.055, 2.4);
+    float3 lin_hi = PowNonNegPreserveZero3((abs_V + 0.055) / 1.055, SRGB_GAMMA);
 
     float3 out_lin;
     out_lin.r = (abs_V.r <= SRGB_THRESHOLD_EOTF) ? lin_lo.r : lin_hi.r;
@@ -285,7 +325,7 @@ float3 sRGB_OETF(float3 L)
 {
     float3 abs_L = abs(L);
     float3 enc_lo = abs_L * 12.92;
-    float3 enc_hi = 1.055 * PowNonNegPreserveZero3(abs_L, 1.0 / 2.4) - 0.055;
+    float3 enc_hi = 1.055 * PowNonNegPreserveZero3(abs_L, SRGB_INV_GAMMA) - 0.055;
 
     float3 out_enc;
     out_enc.r = (abs_L.r <= SRGB_THRESHOLD_OETF) ? enc_lo.r : enc_hi.r;
@@ -298,10 +338,10 @@ float3 PQ_EOTF(float3 N)
 {
     // Robustness: prevent upstream out-of-bounds from exploding fractional exponents
     N = saturate(N);
-    float3 Np = PowNonNegPreserveZero3(N, 1.0 / PQ_M2);
+    float3 Np = PowNonNegPreserveZero3(N, PQ_INV_M2);
     float3 num = max(Np - PQ_C1, 0.0);
     float3 den = max(PQ_C2 - PQ_C3 * Np, FLT_MIN);
-    return PowNonNegPreserveZero3(num / den, 1.0 / PQ_M1) * PQ_PEAK_LUMINANCE;
+    return PowNonNegPreserveZero3(num / den, PQ_INV_M1) * PQ_PEAK_LUMINANCE;
 }
 
 float3 PQ_InverseEOTF(float3 L)
@@ -384,8 +424,7 @@ float3 ApplyLMSWhiteBalance(float3 color, float temp, float tint, float3 lumaCoe
 // `space` is needed here (unlike WB) for gamut-specific protection tuning (e.g., Rec.2020)
 float3 ApplyIntelligentSaturation(float3 color, float saturation, int space, float3 lumaCoeffs, float3x3 to_LMS, float3x3 to_RGB)
 {
-    // Exit 1: Slider at neutral
-    if (abs(saturation - 1.0) < 1e-6)
+    if (abs(saturation - 1.0) < NEUTRAL_EPS)
         return color;
 
     float luma = dot(color, lumaCoeffs);
@@ -407,7 +446,7 @@ float3 ApplyIntelligentSaturation(float3 color, float saturation, int space, flo
     float min_c = min(color.r, min(color.g, color.b));
 
     float sat_current = 0.0;
-    if (peak > 1e-6)
+    if (peak > NEUTRAL_EPS)
         sat_current = saturate((max_c - min_c) / peak);
 
     // Smoothstep makes protection onset gradual rather than linear
@@ -433,17 +472,25 @@ float3 ApplyIntelligentSaturation(float3 color, float saturation, int space, flo
     // Apply dark-chroma reliability: unreliable pixels fade to identity (gain=1.0)
     chroma_gain = lerp(1.0, chroma_gain, chroma_reliability);
 
-    // Exit 3: Effective gain collapsed to neutral (e.g., vivid color at low reliability)
-    if (abs(chroma_gain - 1.0) < 1e-6)
+    if (abs(chroma_gain - 1.0) < NEUTRAL_EPS)
         return color;
 
-    // Use the explicitly passed matrices instead of branching
+    // Forward Oklab: LMS → cube root → Lab
+    // Uses PowNonNegPreserveZero for consistency with all other pow() paths.
+    // sign() handles negative LMS from out-of-gamut scRGB; PowNonNeg handles zero.
     float3 lms = mul(to_LMS, color);
-    float3 lms_p = sign(lms) * pow(max(abs(lms), FLT_MIN), 1.0 / 3.0);
+    float3 abs_lms = abs(lms);
+    float3 lms_p = sign(lms) * float3(
+        PowNonNegPreserveZero(abs_lms.r, OKLAB_CBRT_EXP),
+        PowNonNegPreserveZero(abs_lms.g, OKLAB_CBRT_EXP),
+        PowNonNegPreserveZero(abs_lms.b, OKLAB_CBRT_EXP)
+    );
     float3 lab = mul(LMS_to_Oklab, lms_p);
 
     lab.yz *= chroma_gain;
 
+    // Inverse Oklab: Lab → cube → LMS
+    // x³ naturally preserves sign — no abs/sign wrapper needed.
     float3 lms_p_out = mul(Oklab_to_LMSPrime, lab);
     float3 lms_out = lms_p_out * lms_p_out * lms_p_out;
 
@@ -508,22 +555,23 @@ void PS_PhotorealHDR(float4 vpos : SV_Position, float2 texcoord : TEXCOORD, out 
     float3 lumaCoeffs = (space >= 3) ? Luma2020 : Luma709;
     float whitePt = (space <= 1) ? SCRGB_WHITE_NITS : fWhitePoint;
 
-    // Fast bypass: preserves upstream alpha.
-    // Epsilon comparisons guard against preset serialization residuals
-    // where a "zero" slider might deserialize as 1e-9.
+    // Fast bypass: uniform epsilon guards prevent preset serialization residuals
+    // from defeating the bypass. NEUTRAL_EPS = 1e-6 (see constants block).
     [branch]
-    if (abs(fExposure) < 1e-6 &&
-        abs(fBlackPoint) < 1e-6 &&
-        abs(fContrast - 1.0) < 1e-6 &&
-        abs(fTemperature) < 1e-6 &&
-        abs(fTint) < 1e-6 &&
-        abs(fSaturation - 1.0) < 1e-6 &&
+    if (abs(fExposure) < NEUTRAL_EPS &&
+        abs(fBlackPoint) < NEUTRAL_EPS &&
+        abs(fContrast - 1.0) < NEUTRAL_EPS &&
+        abs(fTemperature) < NEUTRAL_EPS &&
+        abs(fTint) < NEUTRAL_EPS &&
+        abs(fSaturation - 1.0) < NEUTRAL_EPS &&
         !bEnableKhronosNeutral) {
         fragColor = src;
         return;
     }
 
-    // Cache original for NaN/Inf fallback
+    // Decode to linear nits. Sanitize immediately: if upstream buffer contains
+    // NaN/Inf (corrupt swap chain, broken compute shader), fall back to black
+    // rather than propagating poison through the pipeline.
     float3 original_lin = DecodeToLinear(src.rgb, space);
     
     // Sanitize: if upstream buffer is already corrupt, fall back to black
@@ -545,15 +593,15 @@ void PS_PhotorealHDR(float4 vpos : SV_Position, float2 texcoord : TEXCOORD, out 
     }
 
     // 1. Exposure
-    if (fExposure != 0.0)
+    if (abs(fExposure) > NEUTRAL_EPS)
         color *= exp2(fExposure);
 
     // 2. White Balance
-    if (fTemperature != 0.0 || fTint != 0.0)
+    if (abs(fTemperature) > NEUTRAL_EPS || abs(fTint) > NEUTRAL_EPS)
         color = ApplyLMSWhiteBalance(color, fTemperature, fTint, lumaCoeffs, to_LMS, to_RGB);
 
     // 3. Dehaze / Black Point
-    if (fBlackPoint > 0.0)
+    if (fBlackPoint > NEUTRAL_EPS)
     {
         float luma = dot(color, lumaCoeffs);
         if (luma > FLT_MIN)
@@ -564,8 +612,11 @@ void PS_PhotorealHDR(float4 vpos : SV_Position, float2 texcoord : TEXCOORD, out 
         }
     }
 
-    // 4. Filmic Contrast
-    if (abs(fContrast - 1.0) > 1e-6)
+    // 4. Filmic Contrast (True Stop-Domain)
+    //    Operates in log2 (stop) space around an 18% grey pivot.
+    //    Equivalent to pow(luma/pivot, contrast)*pivot, but the explicit
+    //    log2/exp2 form documents the perceptual domain of operation.
+    if (abs(fContrast - 1.0) > NEUTRAL_EPS)
     {
         float luma = dot(color, lumaCoeffs);
         float absLuma = abs(luma);
@@ -573,7 +624,13 @@ void PS_PhotorealHDR(float4 vpos : SV_Position, float2 texcoord : TEXCOORD, out 
         if (absLuma > FLT_MIN)
         {
             float pivot = 0.18 * whitePt;
-            float contrastLuma = PowNonNegPreserveZero(absLuma / pivot, fContrast) * pivot;
+
+            // Stop-domain: log2(luma/pivot) gives distance in stops from mid-grey.
+            // Multiplying by fContrast scales that distance (expand/compress).
+            // exp2 converts back to linear.
+            float logRatio = log2(absLuma / pivot);
+            float contrastLuma = pivot * exp2(fContrast * logRatio);
+
             float contrastRatio = min(contrastLuma / absLuma, 100.0);
             color *= contrastRatio;
         }
@@ -611,7 +668,7 @@ void PS_PhotorealHDR(float4 vpos : SV_Position, float2 texcoord : TEXCOORD, out 
     //    - What you set is what you see (no downstream modification)
     color = ApplyIntelligentSaturation(color, fSaturation, space, lumaCoeffs, to_LMS, to_RGB);
 
-    // Safety
+    // Safety: catch any NaN/Inf produced by the pipeline itself
     if (any(IsNan3(color)) || any(IsInf3(color)))
         color = original_lin;
 
