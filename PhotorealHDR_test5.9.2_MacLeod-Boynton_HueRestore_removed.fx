@@ -236,6 +236,40 @@ uniform float fContrast <
     ui_category = "Tone & Exposure";
 > = 1.03;
 
+uniform float fContrastPivot <
+    ui_type = "slider";
+    ui_min = 0.01; ui_max = 1.00; ui_step = 0.01;
+    ui_label = "Contrast Pivot";
+    ui_tooltip = "The luminance value that remains unchanged when contrast is adjusted.\n"
+                "0.18 = Photographic middle gray (default, filmic look).\n"
+                "Lower values: more shadow modification, less highlight modification.\n"
+                "Higher values: less shadow modification, more highlight modification.\n"
+                "Does not prevent highlight expansion — use the Highlights slider for that.";
+    ui_category = "Tone & Exposure";
+> = 0.18;
+
+uniform float fShadows <
+    ui_type = "slider";
+    ui_min = -1.0; ui_max = 1.0; ui_step = 0.001;
+    ui_label = "Shadows (Log Recovery)";
+    ui_tooltip = "Lifts or deepens shadow detail in the stop domain.\n"
+                "+1.0 = Lift up to 3 stops (recover shadow detail).\n"
+                "-1.0 = Deepen up to 3 stops (crush shadows for mood).\n"
+                "Operates below the Contrast Pivot. Zero effect at the pivot.\n"
+                "C1 continuous with the contrast curve (seamless transition).";
+    ui_category = "Tone & Exposure";
+> = 0.0;
+
+uniform float fHighlights <
+    ui_type = "slider";
+    ui_min = -1.0; ui_max = 1.0; ui_step = 0.001;
+    ui_label = "Highlights (Log Recovery)";
+    ui_tooltip = "Protects (-1.0) or boosts (+1.0) highlights.\n"
+                 "Use negative values to recover detail blown out by high contrast.\n"
+                 "Operates as a mathematically smooth shoulder curve.";
+    ui_category = "Tone & Exposure";
+> = 0.0;
+
 uniform float fTemperature <
     ui_type = "slider";
     ui_min = -0.50; ui_max = 0.50; ui_step = 0.001;
@@ -745,6 +779,8 @@ void PS_PhotorealHDR(float4 vpos : SV_Position, float2 texcoord : TEXCOORD, out 
     if (abs(fExposure) < NEUTRAL_EPS &&
         abs(fBlackPoint) < NEUTRAL_EPS &&
         abs(fContrast - 1.0) < NEUTRAL_EPS &&
+        abs(fShadows) < NEUTRAL_EPS &&
+        abs(fHighlights) < NEUTRAL_EPS &&
         abs(fTemperature) < NEUTRAL_EPS &&
         abs(fTint) < NEUTRAL_EPS &&
         abs(fSaturation - 1.0) < NEUTRAL_EPS &&
@@ -798,31 +834,60 @@ void PS_PhotorealHDR(float4 vpos : SV_Position, float2 texcoord : TEXCOORD, out 
         }
     }
 
-    // ── Pipeline Stage 4: Filmic Contrast ───────────────────────────────────
-    // Stop-domain power curve pivoted at 18% grey.
-    // Equivalent to pow(luma/pivot, contrast) * pivot, expressed as
-    // explicit log2/exp2 to document the perceptual domain of operation.
+    // ── Pipeline Stage 4: Filmic Contrast & Tonal EQ ───────────────────────
+    // Three-zone stop-domain tonal control:
+    //   Contrast: power curve (log2 multiplier) pivoted at fContrastPivot.
+    //   Shadows:  rational C1 correction below pivot, asymptoting to ±3 stops.
+    //   Highlights: rational C1 correction above pivot, asymptoting to ±3 stops.
     //
-    // Signed-luminance safe: uses abs(luma) for the power curve, then applies
-    // the resulting ratio to all RGB channels. This preserves chromaticity
-    // and correctly handles negative-luma scRGB values (ratio is always positive).
+    // The correction function S·x²/(x²+a²) has the following properties:
+    //   - f(0) = 0:  zero correction at pivot (pivot luminance preserved exactly)
+    //   - f'(0) = 0: zero derivative at pivot (contrast alone controls local slope)
+    //   - f(∞) → S:  asymptotic recovery of S stops in deep shadows/highlights
+    //   - Monotonic: provably f'(x) > 0 for |S| ≤ 3.0 with a² = 6.0
+    //                (minimum derivative = 20.5% of nominal at x = ±a/√3)
     //
-    // 100x ratio ceiling: prevents extreme amplification of sub-perceptual
-    // luminances. Without this cap, a pixel at 1e-5 nits with fContrast=1.5
-    // would produce a ratio of ~580x, amplifying quantization noise into
-    // visible artifacts. 100x (6.6 stops) is conservative: it allows full
-    // contrast range for any luminance above ~0.002 nits while preventing
-    // noise amplification in the numerical floor.
-    if (abs(fContrast - 1.0) > NEUTRAL_EPS)
+    // The correction is C2 within each zone but C1 (not C2) at the pivot when
+    // fShadows ≠ fHighlights (f''(0⁻) = S/2, f''(0⁺) = H/2). C2 discontinuity
+    // at a single luminance value is visually imperceptible — standard practice
+    // in professional grading (DaVinci Resolve Log Wheels use the same approach).
+    //
+    // Signed-luminance safe: abs(luma) for the curve, ratio applied to RGB.
+    // 100x ratio ceiling: prevents noise amplification in sub-perceptual luminances
+    // (see V5.9.1 documentation for derivation).
+    if (abs(fContrast - 1.0) > NEUTRAL_EPS || abs(fShadows) > NEUTRAL_EPS || abs(fHighlights) > NEUTRAL_EPS)
     {
         float luma = dot(color, lumaCoeffs);
         float absLuma = abs(luma);
 
         if (absLuma > FLT_MIN)
         {
-            float pivot = 0.18 * whitePt;
+            float pivot = fContrastPivot * whitePt;
             float logRatio = log2(absLuma / pivot);
-            float contrastLuma = pivot * exp2(fContrast * logRatio);
+
+            // 1. Contrast: linear multiplier in log (stop) space.
+            //    fContrast > 1.0 expands dynamic range around pivot.
+            //    fContrast < 1.0 compresses it (recovers overall detail).
+            float x = logRatio * fContrast;
+
+            // 2. Tonal EQ: rational C1-continuous recovery curves.
+            //    a² = 6.0 chosen for 20.5% minimum derivative margin at ±3 stops.
+            //    (a² = 4.0 gives only 2.6% margin — near-flat band at max slider.)
+            //    Correction reaches 50% at |x| = √6 ≈ 2.45 stops from pivot.
+            float a2 = 6.0;
+
+            if (x < 0.0 && abs(fShadows) > NEUTRAL_EPS)
+            {
+                float S = fShadows * 3.0;
+                x = x + S * ((x * x) / (x * x + a2));
+            }
+            else if (x > 0.0 && abs(fHighlights) > NEUTRAL_EPS)
+            {
+                float H = fHighlights * 3.0;
+                x = x + H * ((x * x) / (x * x + a2));
+            }
+
+            float contrastLuma = pivot * exp2(x);
             color *= min(contrastLuma / absLuma, 100.0);
         }
     }
@@ -891,7 +956,7 @@ technique PhotorealHDR_Mastering <
                  "  1. Exposure (linear EV shift)\n"
                  "  2. LMS White Balance (exponential cone-domain)\n"
                  "  3. Subtractive Black Point (C1 parabolic toe)\n"
-                 "  4. Filmic Contrast (signed-luminance stop-domain)\n"
+                 "  4. Filmic Contrast + Tonal EQ (stop-domain, C1 rational recovery)\n"
                  "  5. Khronos PBR Neutral Highlight Compression\n"
                  "  6. MacLeod-Boynton Isoluminant Purity\n\n"
                  "Design: Precision over performance.\n"
