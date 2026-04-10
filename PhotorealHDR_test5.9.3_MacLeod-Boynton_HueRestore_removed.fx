@@ -9,7 +9,13 @@
 //   (nits), BEFORE Khronos compresses into display peak.
 // - Legacy Khronos desaturation remains available but is recommended at 0.00.
 //
-// Design Philosophy: PRECISION OVER PERFORMANCE
+//* Design Philosophy: PRECISION OVER PERFORMANCE
+//* - True IEEE 754 Math (No fast intrinsics or approximations)
+//* - Exact IEC/SMPTE Standard Constants
+//* - Bit-Exact Neutrality Logic
+//* - Pre-computed High-Precision Kernels
+//* - True Stop-Domain HDR Processing
+//* - MacLeod-Boynton Physiological Chromaticity Processing
 // ============================================================================
 
 #include "ReShade.fxh"
