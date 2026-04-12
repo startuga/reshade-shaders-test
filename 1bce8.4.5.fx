@@ -9,11 +9,11 @@
  * - True Stop-Domain HDR Processing
  * - Oklab Perceptual Chromaticity Processing
  *
- * Version: 8.4.4 (Chroma Reliability Alignment)
- * - Fix: Bilateral chroma reliability smoothstep inlined in the hot loop
- * - Fix: Pre-pass, ChromaEdge, and bilateral chroma weighting now share the same reliability ramp
- * - Fix: Loop-invariant chroma branch hoisted via use_chroma
- * - Includes all v8.4.2 and v8.4.1 fixes
+ * Version: 8.4.5 (Debug Encoding Fix)
+ * - Fix: Debug path double-normalization removed; debug outputs now correctly
+ *        encoded as display-linear [0,1] values per color space
+ * - Fix: Technique tooltip version aligned to current release
+ * - Includes all v8.4.4, v8.4.3, v8.4.2, and v8.4.1 fixes
  * Author: startuga
  */
 
@@ -1075,18 +1075,32 @@ void PS_BilateralContrast(float4 vpos : SV_Position, out float4 fragColor : SV_T
 
     float3 result = ProcessPixel(pos);
 
+    int activeSpace = (iColorSpaceOverride > 0) ? iColorSpaceOverride : BUFFER_COLOR_SPACE;
+
     [branch]
     if (iDebugMode != 0) {
-        float3 encoded = EncodeFromLinear(max(result, 0.0) * GetResolvedWhitePoint());
-        if (((iColorSpaceOverride > 0) ? iColorSpaceOverride : BUFFER_COLOR_SPACE) <= 1)
-            encoded = saturate(encoded);
-        fragColor = float4(encoded, src.a); // Preserve alpha in debug modes
+        // FIX (v8.4.5): Debug outputs are display-linear [0,1] values.
+        // They must be encoded for the target buffer as normalized display values,
+        // NOT as scene-linear nits (which would cause double-normalization or
+        // extreme darkening depending on color space).
+        float3 debug_out = max(result, 0.0);
+        float3 encoded;
+        [branch]
+        if (activeSpace == 3)
+            // PQ: map [0,1] debug to [0,1000] nits for visible PQ encoding
+            encoded = PQ_InverseEOTF(debug_out * 1000.0);
+        else if (activeSpace == 2)
+            // scRGB: linear [0,1] is native buffer format
+            encoded = debug_out;
+        else
+            // sRGB: apply gamma OETF to display-linear values
+            encoded = sRGB_OETF(saturate(debug_out));
+        fragColor = float4(encoded, src.a);
         return;
     }
 
     float3 encoded = EncodeFromLinear(result);
 
-    int activeSpace = (iColorSpaceOverride > 0) ? iColorSpaceOverride : BUFFER_COLOR_SPACE;
     [flatten]
     if (activeSpace <= 1) encoded = saturate(encoded);
 
@@ -1098,9 +1112,14 @@ void PS_BilateralContrast(float4 vpos : SV_Position, out float4 fragColor : SV_T
 }
 
 technique BilateralContrast_Reference <
-    ui_label = "Bilateral Contrast v8.4.4 (Mastering Edition)";
+    ui_label = "Bilateral Contrast v8.4.5 (Mastering Edition)";
     ui_tooltip = "MASTERING QUALITY - True Math Processing\n\n"
-                 "v8.4.3 Fixes:\n"
+                 "v8.4.5 Fixes:\n"
+                 "- Fix: Debug path double-normalization removed\n"
+                 "- Fix: Debug outputs now correctly encoded as display-linear [0,1]\n"
+                 "       per color space (sRGB gamma, scRGB linear, PQ scaled)\n"
+                 "- Fix: Technique tooltip version aligned\n\n"
+                 "v8.4.4 Fixes:\n"
                  "- Fix: Bilateral chroma reliability smoothstep inlined in hot loop\n"
                  "- Fix: Pre-pass, ChromaEdge, and bilateral chroma weighting aligned\n"
                  "- Fix: Loop-invariant chroma branch hoisted via use_chroma\n\n"
@@ -1131,4 +1150,3 @@ technique BilateralContrast_Reference <
         PixelShader  = PS_BilateralContrast;
     }
 }
-
