@@ -9,10 +9,9 @@
  * - True Stop-Domain HDR Processing
  * - Oklab Perceptual Chromaticity Processing
  *
- * Version: 8.4.5 (Debug Encoding Fix)
- * - Fix: Debug path double-normalization removed; debug outputs now correctly
- *        encoded as display-linear [0,1] values per color space
- * - Fix: Technique tooltip version aligned to current release
+ * Version: 8.4.5 (Trimmed Output)
+ * - Removed: SoftClipGamut (redundant with zone/negative protection)
+ * - Removed: 10-bit quantization simulation (trimmed for clean output)
  * - Includes all v8.4.4, v8.4.3, v8.4.2, and v8.4.1 fixes
  * Author: startuga
  */
@@ -376,25 +375,6 @@ uniform int iColorSpaceOverride <
     ui_category = "System";
 > = 0;
 
-uniform bool bGamutMapping <
-    ui_label = "Gamut Mapping (Soft Knee Compression)";
-    ui_category = "Output Quality";
-> = false;
-
-uniform float fGamutKnee <
-    ui_type = "slider";
-    ui_label = "Gamut Knee Strength";
-    ui_min = 0.0; ui_max = 0.1; ui_step = 0.001;
-    ui_tooltip = "Threshold for soft rollover to black. Helps prevent aliasing in dark gradients.";
-    ui_category = "Output Quality";
-> = 0.01;
-
-uniform bool bQuantize10Bit <
-    ui_label = "Simulate 10-bit Interface";
-    ui_tooltip = "Rounds output to nearest 10-bit step (0-1023). Useful for verifying HDR banding.";
-    ui_category = "Output Quality";
-> = false;
-
 uniform int iDebugMode <
     ui_type = "combo";
     ui_label = "Debug Visualization";
@@ -551,25 +531,6 @@ float2 GetOklabChroma(float3 linearRGB, int activeSpace)
     // Normalize by Lightness L to get pure chromaticity direction
     float L = max(abs(oklab.x), FLT_MIN);
     return oklab.yz / L;
-}
-
-float3 SoftClipGamut(float3 lin, float knee)
-{
-    float minComponent = min(min(lin.r, lin.g), lin.b);
-
-    if (minComponent < knee)
-    {
-        float luma = GetLuminanceCS(lin);
-        float t = (knee > FLT_MIN) ? saturate((knee - minComponent) / (knee + FLT_MIN)) : step(minComponent, 0.0);
-
-        float3 chroma = lin - luma;
-        float scale = luma / (luma - minComponent + FLT_MIN);
-
-        scale = lerp(1.0, min(scale, 1.0), t * t * (3.0 - 2.0 * t));
-
-        lin = luma + chroma * scale;
-    }
-    return lin;
 }
 
 // ==============================================================================
@@ -1050,9 +1011,6 @@ float3 ProcessPixel(int2 center_pos)
 
     float3 final_color = color_lin * ratio;
 
-    [branch]
-    if (bGamutMapping) final_color = SoftClipGamut(final_color, fGamutKnee);
-
     if (any(IsNan3(final_color)) || any(IsInf3(final_color))) return color_lin;
 
     return final_color;
@@ -1079,7 +1037,7 @@ void PS_BilateralContrast(float4 vpos : SV_Position, out float4 fragColor : SV_T
 
     [branch]
     if (iDebugMode != 0) {
-        // FIX (v8.4.5): Debug outputs are display-linear [0,1] values.
+        // Debug outputs are display-linear [0,1] values.
         // They must be encoded for the target buffer as normalized display values,
         // NOT as scene-linear nits (which would cause double-normalization or
         // extreme darkening depending on color space).
@@ -1104,10 +1062,6 @@ void PS_BilateralContrast(float4 vpos : SV_Position, out float4 fragColor : SV_T
     [flatten]
     if (activeSpace <= 1) encoded = saturate(encoded);
 
-    [branch]
-    if (bQuantize10Bit)
-        encoded = round(max(encoded, 0.0) * 1023.0) / 1023.0;
-
     fragColor = float4(encoded, src.a); // Preserve alpha in final output
 }
 
@@ -1115,6 +1069,8 @@ technique BilateralContrast_Reference <
     ui_label = "Bilateral Contrast v8.4.5 (Mastering Edition)";
     ui_tooltip = "MASTERING QUALITY - True Math Processing\n\n"
                  "v8.4.5 Fixes:\n"
+                 "- Removed: SoftClipGamut (redundant with zone/negative protection)\n"
+                 "- Removed: 10-bit quantization simulation (trimmed for clean output)\n\n"
                  "- Fix: Debug path double-normalization removed\n"
                  "- Fix: Debug outputs now correctly encoded as display-linear [0,1]\n"
                  "       per color space (sRGB gamma, scRGB linear, PQ scaled)\n"
