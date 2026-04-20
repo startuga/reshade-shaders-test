@@ -467,7 +467,9 @@ float3 PowNonNegPreserveZero3(float3 x, float e)
 
 float SqrtIEEE(float x)
 {
-    return PowNonNegPreserveZero(x, 0.5);
+    // Native sqrt is correctly rounded to 0.5 ULP per IEEE 754.
+    // Avoids SFU exp2/log2 approximation chains from pow(x, 0.5).
+    return sqrt(max(x, 0.0));
 }
 
 bool IsNanVal(float x)   { return (asuint(x) & 0x7FFFFFFF) > 0x7F800000; }
@@ -541,6 +543,18 @@ float3 EncodeFromLinear(float3 lin, int space)
 // 6. Mathematical Scene-Grade Functions
 // =================================================================================================
 
+// -------------------------------------------------------------------------------------------------
+// ComputeBlackPointRatio
+//
+// Computes the luminance multiplier for a shadow-floored subtractive black point.
+// raw = max((luma - bpNits) / luma, shadowFloor) is the physically correct target ratio:
+//   - For luma > bpNits: scales down toward (1 - bpNits/luma) as a pure subtraction.
+//   - For luma < bpNits: clamps at shadowFloor, preventing total black crush.
+//
+// The smoothstep toe blends from shadowFloor (at luma=0) to raw (at luma=4×bpNits).
+// lerp(shadowFloor, raw, smooth_t) is correct at BOTH endpoints:
+//   t=0 (luma→0):     returns shadowFloor = the correct physical ratio for sub-bpNits pixels.
+//   t=1 (luma=4×bp):  returns raw         = the full subtractive ratio with floor applied.
 float ComputeBlackPointRatio(float luma, float bpNits, float shadowFloor)
 {
     if (bpNits <= FLT_MIN || luma <= FLT_MIN) return 1.0;
@@ -550,8 +564,7 @@ float ComputeBlackPointRatio(float luma, float bpNits, float shadowFloor)
     float t = saturate(luma / (4.0 * bpNits));
     float smooth_t = t * t * (3.0 - 2.0 * t);
 
-        return lerp(shadowFloor, raw, smooth_t);   // V5.9.7 original — correct
-    //  return lerp(1.0, raw, smooth_t);            // V5.9.7-r1 — broke dehaze
+        return lerp(shadowFloor, raw, smooth_t);
 }
 
 float3 ApplyLMSWhiteBalance(float3 color, float temp, float tint, float3 lumaCoeffs, float3x3 to_LMS, float3x3 to_RGB)
@@ -988,13 +1001,11 @@ void PS_PhotorealHDR(float4 vpos : SV_Position, float2 texcoord : TEXCOORD, out 
     // scRGB encodes BT.2020 colors through negative 709 channels: using 709 as the
     // boundary (old behavior) incorrectly destroyed all WCG content.
     // Note: to_LMS_boundary is no longer needed — the fallback uses MB-space nudge.
-    // Boundary matrix for Gamut Guard — which gamut to protect against.
-    // scRGB (space==2) and PQ (space==3) protect BT.2020; sRGB protects BT.709.
     float3x3 to_RGB_boundary;
     if (space >= 2)
-        to_RGB_boundary = LMS_to_RGB2020;
+        to_RGB_boundary = LMS_to_RGB2020;  // scRGB + PQ: protect BT.2020 gamut
     else
-        to_RGB_boundary = LMS_to_RGB709;
+        to_RGB_boundary = LMS_to_RGB709;   // sRGB: protect BT.709 gamut
 
     float2 mb_white = MB_WHITE_D65;
 
