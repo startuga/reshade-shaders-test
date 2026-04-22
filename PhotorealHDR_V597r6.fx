@@ -609,7 +609,7 @@ float3 MB_to_LMS(float3 mb)
     return float3(mb.x * mb.z, mb.z - (mb.x * mb.z), mb.y * mb.z);
 }
 
-float3 ApplyMBPurity(float3 color, float purity_scale, int space, float3 lumaCoeffs, float3x3 to_LMS, float3x3 to_RGB, float2 mb_white)
+float3 ApplyMBPurity(float3 color, float purity_scale, float3 lumaCoeffs, float3x3 to_LMS, float3x3 to_RGB, float2 mb_white)
 {
     if (abs(purity_scale - 1.0) < NEUTRAL_EPS) return color;
 
@@ -1099,7 +1099,7 @@ void PS_PhotorealHDR(float4 vpos : SV_Position, float2 texcoord : TEXCOORD, out 
     // ---------------------------------------------------------------------------------------------
     // STAGE 6: MACLEOD-BOYNTON ISOLUMINANT PURITY
     // ---------------------------------------------------------------------------------------------
-    color = ApplyMBPurity(color, fSaturation, space, lumaCoeffs, to_LMS, to_RGB, mb_white);
+    color = ApplyMBPurity(color, fSaturation, lumaCoeffs, to_LMS, to_RGB, mb_white);
 
     // ---------------------------------------------------------------------------------------------
     // STAGE 6.5: ANALYTICAL MB GAMUT GUARD (V5.9.7-r3: boundary/reconstruction split)
