@@ -526,7 +526,6 @@ float2 GetOklabChroma(float3 linearRGB, int activeSpace)
     }
     
     float3 lms = mul(m, linearRGB);
-    
     float3 abs_lms = max(abs(lms), FLT_MIN);
     float3 lms_p = sign(lms) * pow(abs_lms, 1.0 / 3.0);
     float3 oklab = mul(LMS_to_Oklab, lms_p);
@@ -625,7 +624,11 @@ void PS_PrePass(float4 vpos : SV_Position, out float4 outData : SV_Target)
 // 8. Analysis & Edge Detection (LDS / Groupshared Optimized)
 // ==============================================================================
 
+// Note: groupshared float4 array implies 16-byte strides.
+// On some AMD GCN/RDNA architectures, this may cause LDS bank conflicts.
+// If LDS latency becomes a bottleneck, consider splitting into planar arrays (R, G, B, A).
 groupshared float4 gs_LinearData[LDS_TILE_SIZE * LDS_TILE_SIZE];
+
 #define GS_IDX(x, y) ((y) * LDS_TILE_SIZE + (x))
 
 float FetchPerceptualLumaShared(int2 local_pos)
@@ -864,7 +867,18 @@ void WriteDebugOut(int2 pos, float3 dbg, float alpha)
     tex2Dstore(StorageBilateralOut, pos, float4(encoded, alpha));
 }
 
-// Neumaier accumulation macro for the bilateral loop (prevents function divergence)
+/**
+ * BCE_ACCUMULATE Macro
+ * 
+ * Implicit Contract - Expects the following variables in the outer scope:
+ * - float log2_center, inv_2_sigma_s_sq, inv_2_sigma_r_sq, inv_2_sigma_c_sq
+ * - float spatial_y
+ * - bool use_chroma
+ * - float center_chroma_reliability
+ * - float2 center_chroma
+ * - float2 stats_log, stats_sq, stats_w
+ * - float min_log, max_log
+ */
 #define BCE_ACCUMULATE(n_data, x_coord)                                                                                    \
 {                                                                                                                          \
     float _n_log = (n_data).r;                                                                                             \
@@ -1242,21 +1256,25 @@ technique BilateralContrast_Reference <
 {
     pass PreCompute
     {
-        VertexShader = PostProcessVS;
-        PixelShader  = PS_PrePass;
-        RenderTarget = TexLinearData;
+        VertexShader      = PostProcessVS;
+        PixelShader       = PS_PrePass;
+        RenderTarget      = TexLinearData;
+        VertexCount       = 3;
+        PrimitiveTopology = TRIANGLELIST;
     }
     
     pass BilateralCompute
     {
-        ComputeShader = CS_BilateralContrast;
-        DispatchSizeX = (BUFFER_WIDTH + 15) / 16;
-        DispatchSizeY = (BUFFER_HEIGHT + 15) / 16;
+        ComputeShader     = CS_BilateralContrast;
+        DispatchSizeX     = (BUFFER_WIDTH + 15) / 16;
+        DispatchSizeY     = (BUFFER_HEIGHT + 15) / 16;
     }
     
     pass Output
     {
-        VertexShader = PostProcessVS;
-        PixelShader  = PS_OutputToScreen;
+        VertexShader      = PostProcessVS;
+        PixelShader       = PS_OutputToScreen;
+        VertexCount       = 3;
+        PrimitiveTopology = TRIANGLELIST;
     }
 }
