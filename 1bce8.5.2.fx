@@ -607,6 +607,7 @@ void PS_PrePass(float4 vpos : SV_Position, out float4 outData : SV_Target)
     int space = (iColorSpaceOverride > 0) ? iColorSpaceOverride : BUFFER_COLOR_SPACE;
 
     float3 color_lin = DecodeToLinear(tex2Dfetch(SamplerBackBuffer, pos).rgb);
+    if (any(IsNan3(color_lin)) || any(IsInf3(color_lin))) color_lin = 0.0;
     
     // Note: Implicitly relies on same ColorSpace logic resolution
     float luma_lin = GetLuminanceCS(color_lin);
@@ -977,6 +978,7 @@ void CS_BilateralContrast(uint3 id : SV_DispatchThreadID, uint3 tid : SV_GroupTh
     // Double decode from v8.4.6 is intentionally retained here for 
     // exact original behavior without requiring an extra render target.
     float3 color_lin  = DecodeToLinear(src.rgb);
+    if (any(IsNan3(color_lin)) || any(IsInf3(color_lin))) color_lin = 0.0;
 
     if (iDebugMode == 0 && luma_lin <= FLT_MIN) 
     {
