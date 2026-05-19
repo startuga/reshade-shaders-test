@@ -10,7 +10,7 @@
  * - Oklab Perceptual Chromaticity Processing
  * - Compute Shader with groupshared LDS tile cache
  *
- * Version: 8.5.0 (Compute LDS Edition)
+ * Version: 8.5.1 (Compute LDS Edition - Final)
  * - Compute Shader path with 32x32 groupshared tile (16x16 threads + 8px halo)
  * - Loop fission: LDS inner tile + VRAM outer fallback for radii > 8
  * - All edge detection and chroma analysis via LDS (zero VRAM fetches in hot paths)
@@ -169,7 +169,7 @@ sampler2D SamplerLinearData
     AddressV  = CLAMP;
 };
 
-texture2D TexBilateralOut { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = RGBA16F; };
+texture2D TexBilateralOut { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = PREPASS_FORMAT; };
 storage2D StorageBilateralOut { Texture = TexBilateralOut; };
 sampler2D SamplerBilateralOut
 {
@@ -603,10 +603,11 @@ void PS_PrePass(float4 vpos : SV_Position, out float4 outData : SV_Target)
 {
     int2 pos = int2(vpos.xy);
     int space = (iColorSpaceOverride > 0) ? iColorSpaceOverride : BUFFER_COLOR_SPACE;
-    float3 lumaCoeffs = (space >= 3) ? Luma2020 : Luma709;
 
     float3 color_lin = DecodeToLinear(tex2Dfetch(SamplerBackBuffer, pos).rgb);
-    float luma_lin = dot(color_lin, lumaCoeffs);
+    
+    // Note: Implicitly relies on same ColorSpace logic resolution
+    float luma_lin = GetLuminanceCS(color_lin);
 
     float safe_luma = max(luma_lin, FLT_MIN);
     float log2_luma = log2(safe_luma);
@@ -717,7 +718,8 @@ float LaplacianOfGaussianShared(int2 local_center)
             response += luma * LoG_Kernel[idx];
         }
     }
-    return response * response;
+    // 0.00390625 is 1/256 normalization for the LoG kernel peak response squared
+    return response * response * 0.00390625;
 }
 
 float StructureTensorShared(int2 local_center)
@@ -961,6 +963,9 @@ void CS_BilateralContrast(uint3 id : SV_DispatchThreadID, uint3 tid : SV_GroupTh
     float log2_center = center_data.r;
     float luma_lin    = center_data.a;
     float whitePt     = GetResolvedWhitePoint();
+    
+    // Double decode from v8.4.6 is intentionally retained here for 
+    // exact original behavior without requiring an extra render target.
     float3 color_lin  = DecodeToLinear(src.rgb);
 
     if (iDebugMode == 0 && luma_lin <= FLT_MIN) 
@@ -1074,17 +1079,22 @@ void CS_BilateralContrast(uint3 id : SV_DispatchThreadID, uint3 tid : SV_GroupTh
     int x_max_off = (BUFFER_WIDTH - 1) - global_pos.x;
 
     int r_lds = min(max_r, LDS_RADIUS);
+    
+    int lds_y_start = max(-r_lds, -global_pos.y);
+    int lds_y_end   = min( r_lds, (BUFFER_HEIGHT - 1) - global_pos.y);
+    int lds_x_min   = -global_pos.x;
+    int lds_x_max   = (BUFFER_WIDTH - 1) - global_pos.x;
 
-    // Phase 4A: LDS-only inner loop (confined to LDS halo)
+    // Phase 4A: LDS-only inner loop (confined to LDS halo and screen bounds)
     [loop]
-    for (int y = -r_lds; y <= r_lds; ++y)
+    for (int y = lds_y_start; y <= lds_y_end; ++y)
     {
         float y_f = float(y);
         float spatial_y = y_f * y_f * inv_2_sigma_s_sq;
         
         int x_limit_circ = (int)TrueSqrt(max(0.0, r_limit_sq - y_f * y_f));
-        int x_start = max(-x_limit_circ, -r_lds);
-        int x_end   = min( x_limit_circ,  r_lds);
+        int x_start = max(max(-x_limit_circ, -r_lds), lds_x_min);
+        int x_end   = min(min( x_limit_circ,  r_lds), lds_x_max);
         int local_y = local_center.y + y;
 
         [loop]
@@ -1117,7 +1127,8 @@ void CS_BilateralContrast(uint3 id : SV_DispatchThreadID, uint3 tid : SV_GroupTh
                 [loop]
                 for (int x = x_start; x <= x_end; ++x)
                 {
-                    float4 n_data = tex2Dfetch(SamplerLinearData, global_pos + int2(x, y));
+                    int2 fetch_pos = clamp(global_pos + int2(x, y), int2(0, 0), int2(BUFFER_WIDTH - 1, BUFFER_HEIGHT - 1));
+                    float4 n_data = tex2Dfetch(SamplerLinearData, fetch_pos);
                     BCE_ACCUMULATE(n_data, x);
                 }
             }
@@ -1128,7 +1139,8 @@ void CS_BilateralContrast(uint3 id : SV_DispatchThreadID, uint3 tid : SV_GroupTh
                 [loop]
                 for (int x = x_start; x <= left_end; ++x)
                 {
-                    float4 n_data = tex2Dfetch(SamplerLinearData, global_pos + int2(x, y));
+                    int2 fetch_pos = clamp(global_pos + int2(x, y), int2(0, 0), int2(BUFFER_WIDTH - 1, BUFFER_HEIGHT - 1));
+                    float4 n_data = tex2Dfetch(SamplerLinearData, fetch_pos);
                     BCE_ACCUMULATE(n_data, x);
                 }
                 
@@ -1136,7 +1148,8 @@ void CS_BilateralContrast(uint3 id : SV_DispatchThreadID, uint3 tid : SV_GroupTh
                 [loop]
                 for (int x = right_start; x <= x_end; ++x)
                 {
-                    float4 n_data = tex2Dfetch(SamplerLinearData, global_pos + int2(x, y));
+                    int2 fetch_pos = clamp(global_pos + int2(x, y), int2(0, 0), int2(BUFFER_WIDTH - 1, BUFFER_HEIGHT - 1));
+                    float4 n_data = tex2Dfetch(SamplerLinearData, fetch_pos);
                     BCE_ACCUMULATE(n_data, x);
                 }
             }
@@ -1160,6 +1173,8 @@ void CS_BilateralContrast(uint3 id : SV_DispatchThreadID, uint3 tid : SV_GroupTh
     float diff      = log2_center - blurred;
 
     float strength = fStrength;
+    
+    [branch]
     if (bAdaptiveStrength)
     {
         strength = CalculateAdaptiveStrength(total_log, total_sq, total_w, min_log, max_log, fStrength, iAdaptiveMode);
@@ -1243,11 +1258,12 @@ void PS_OutputToScreen(float4 vpos : SV_Position, float2 texcoord : TEXCOORD0, o
 }
 
 technique BilateralContrast_Reference <
-    ui_label = "Bilateral Contrast v8.5.0 (Compute LDS Edition)";
+    ui_label = "Bilateral Contrast v8.5.1 (Compute LDS Edition)";
     ui_tooltip = "MASTERING QUALITY - Compute Shader LDS Optimized\n\n"
-                 "v8.5.0 Changes:\n"
+                 "v8.5.1 Changes:\n"
                  "- Compute Shader path with groupshared LDS tile cache (32x32)\n"
                  "- Loop fission: LDS inner tile + VRAM outer fallback\n"
+                 "- Screen boundary constraints enforced natively in LDS loops\n"
                  "- All edge detection and chroma analysis via LDS\n"
                  "- Aligned: PQ debug encoding uses 80 nits reference\n\n"
                  "Requires: DirectX 11+, OpenGL 4.3+, or Vulkan\n\n"
