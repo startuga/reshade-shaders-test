@@ -8,28 +8,9 @@
 // - True Stop-Domain Scene Grading: Log2-domain exposure and contrast with C1 rational recovery.
 // - Physiological Chromaticity: MacLeod-Boynton cone-opponent space for all color operations.
 //
-// V5.9.7-r9 Changes from V5.9.7-r8:
-// - Optimize: Implemented LMS-domain luma projection (transpose multiplier).
-//             By projecting lumaCoeffs through the LMS_to_RGB reconstruction matrix, 
-//             all subsequent luma evaluations (Dehaze, Contrast, MBPurity, Gamut Guard) 
-//             are reduced to a single-cycle dot product (dot(lms, luma_LMS_coeffs)).
-//             This completely eliminates 3 additional float3x3 matrix multiplications.
-// - Cleanup: Deleted dead functions GetLuminanceCS and GetResolvedWhitePoint.
-// - Cleanup: Documented and streamlined shader entry-point parameter bindings.
-//
-// V5.9.7-r8 Changes from V5.9.7-r7:
-// - Restore: Gamut Guard returned to the classic V5.9.7-r7 C^\infty exponential formulation 
-//            (1.0 - exp(-excess / headroom)) to guarantee the highest possible compression quality
-//            near spectral boundaries.
-// - Fix: Calibrated the Abney Effect compensation vector in MacLeod-Boynton space. As purity 
-//         increases, blue naturally shifts toward violet (reddish-blue). The slider now applies 
-//         an inverse angular rotation in the blue quadrant to stabilize perceived hue ("blue stays blue").
-// - Optimize: Restructured pipeline to execute Stages 1-4 entirely in the LMS domain, reducing 
-//             redundant RGB <-> LMS forward/backward matrix conversions from 9 down to 4.
-// - Fix: Implemented physiological NaN/Inf healing to 18% middle-gray rather than solid black 
-//         to prevent jarring single-pixel black flashing on unstable engine buffers.
-//
 // =================================================================================================
+// https://github.com/crosire/reshade-shaders/blob/slim/Shaders/ReShade.fxh
+// https://github.com/crosire/reshade-shaders/blob/slim/REFERENCE.md
 
 #include "ReShade.fxh"
 
@@ -86,10 +67,6 @@ static const float TROLAND_HALF_SAT     = 8000.0;
 
 // -------------------------------------------------------------------------------------------------
 // Scene-Grade Row-Sum-Normalized Matrices
-//
-// INVARIANT: Every row in each RGB→LMS matrix sums to exactly 1.0. This means D65 white
-// {1,1,1} maps to LMS {1,1,1} by construction, and therefore MacLeod-Boynton chromaticity
-// for D65 is always {l=0.5, s=0.5}.
 // -------------------------------------------------------------------------------------------------
 static const float3x3 RGB709_to_LMS = float3x3(
     0.4122214708,  0.5363325363,  0.0514459929,
@@ -323,8 +300,7 @@ uniform int iDebugMode <
 
 float PowNonNegPreserveZero(float x, float e)
 {
-    if (x <= 0.0) return 0.0;
-    return pow(x, e);
+    return (x <= 0.0) ? 0.0 : pow(x, e);
 }
 
 float3 PowNonNegPreserveZero3(float3 x, float e)
@@ -341,10 +317,8 @@ float SqrtIEEE(float x)
     return sqrt(max(x, 0.0));
 }
 
-bool IsNanVal(float x)   { return (asuint(x) & 0x7FFFFFFF) > 0x7F800000; }
-bool IsInfVal(float x)   { return (asuint(x) & 0x7FFFFFFF) == 0x7F800000; }
-bool3 IsNan3(float3 v)   { return bool3(IsNanVal(v.x), IsNanVal(v.y), IsNanVal(v.z)); }
-bool3 IsInf3(float3 v)   { return bool3(IsInfVal(v.x), IsInfVal(v.y), IsInfVal(v.z)); }
+bool3 IsNan3(float3 v)   { return (asuint(v) & 0x7FFFFFFFu) > 0x7F800000u; }
+bool3 IsInf3(float3 v)   { return (asuint(v) & 0x7FFFFFFFu) == 0x7F800000u; }
 
 // =================================================================================================
 // 5. Color Science & EOTF Utilities
@@ -433,17 +407,8 @@ float3 MB_to_LMS(float3 mb)
  */
 float2 ApplyAbneyCorrection(float2 mb_chroma, float2 mb_white, float strength)
 {
-    if (strength <= NEUTRAL_EPS)
-    {
-        return mb_chroma;
-    }
-
     float2 offset = mb_chroma - mb_white;
     float r = SqrtIEEE(dot(offset, offset));
-    if (r < FLT_MIN)
-    {
-        return mb_chroma;
-    }
 
     float angle = atan2(offset.y, offset.x);
     
@@ -452,57 +417,35 @@ float2 ApplyAbneyCorrection(float2 mb_chroma, float2 mb_white, float strength)
     float shift = sin(angle - 0.8) * 0.15 * r * strength;
     angle += shift;
 
-    return mb_white + float2(cos(angle), sin(angle)) * r;
+    float2 corrected = mb_white + float2(cos(angle), sin(angle)) * r;
+    return (strength <= NEUTRAL_EPS || r < FLT_MIN) ? mb_chroma : corrected;
 }
 
 /**
  * ComputeBlackPointRatio
  *
- * Computes the subtractive black-point ratio. The early-out at luma <= FLT_MIN correctly
- * returns shadowFloor, securing C0 and C1 continuity at the limit of black.
+ * Computes the subtractive black-point ratio.
  */
 float ComputeBlackPointRatio(float luma, float bpNits, float shadowFloor)
 {
-    if (bpNits <= FLT_MIN) return 1.0;
-    if (luma <= FLT_MIN) return shadowFloor;
+    float raw = max((luma - bpNits) / max(luma, FLT_MIN), shadowFloor);
 
-    float raw = max((luma - bpNits) / luma, shadowFloor);
-
-    float t = saturate(luma / (4.0 * bpNits));
+    float t = saturate(luma / max(4.0 * bpNits, FLT_MIN));
     float smooth_t = t * t * (3.0 - 2.0 * t);
 
-    return lerp(shadowFloor, raw, smooth_t);
-}
-
-/**
- * LMS White Balance (LMS-In / LMS-Out)
- */
-float3 ApplyLMSWhiteBalanceLMS(float3 lms, float temp, float tint, float3 lumaCoeffs, float3x3 to_RGB)
-{
-    float3 wbStops = 0.35 * float3(temp + tint, -tint, -temp + tint);
-    float3 wbScale = exp2(wbStops);
-
-    float3 d65_wb_rgb = mul(to_RGB, wbScale);
-    float lumaScale   = dot(d65_wb_rgb, lumaCoeffs);
-    wbScale /= max(lumaScale, FLT_MIN);
-
-    return lms * wbScale;
+    float ratio = lerp(shadowFloor, raw, smooth_t);
+    return (bpNits <= FLT_MIN) ? 1.0 : ratio;
 }
 
 /**
  * Troland Bleaching (LMS-In / LMS-Out)
  *
  * Simulates cone photopigment bleaching under intense retinal illuminance.
- * Operates strictly in the LMS domain to bypass redundant matrix round-trips.
+ * Operates strictly in the LMS domain and utilizes direct linear interpolation.
  */
-float3 ApplyTrolandBleachingLMS(float3 lms, float strength, float2 mb_white)
+float3 ApplyTrolandBleachingLMS(float3 lms, float strength)
 {
     float lm_sum = lms.r + lms.g;
-    if (lm_sum <= 0.0)
-    {
-        return lms;
-    }
-
     float3 safe_lms = max(lms, 0.0);
     float3 stimulus = safe_lms * TROLAND_LMS_SCALE;
     float stim_lm   = 0.5 * (stimulus.r + stimulus.g);
@@ -510,10 +453,8 @@ float3 ApplyTrolandBleachingLMS(float3 lms, float strength, float2 mb_white)
     float availability = 1.0 / (1.0 + (stim_lm / max(TROLAND_HALF_SAT, FLT_MIN)));
     float k = lerp(1.0, availability, saturate(strength));
 
-    float3 mb = LMS_to_MB(lms);
-    mb.xy = lerp(mb_white, mb.xy, k);
-
-    return MB_to_LMS(mb);
+    float3 bleached = lerp(0.5 * lm_sum, lms, k);
+    return (lm_sum <= 0.0) ? lms : bleached;
 }
 
 /**
@@ -525,13 +466,8 @@ float3 ApplyTrolandBleachingLMS(float3 lms, float strength, float2 mb_white)
  */
 float3 ApplyMBPurityLMS(float3 lms, float purity_scale, float3 luma_LMS_coeffs, float2 mb_white)
 {
-    if (abs(purity_scale - 1.0) < NEUTRAL_EPS && fAbneyCorrection < NEUTRAL_EPS)
-    {
-        return lms;
-    }
-
     float lm_sum = lms.r + lms.g;
-    if (lm_sum <= 0.0)
+    if (lm_sum <= 0.0 || (abs(purity_scale - 1.0) < NEUTRAL_EPS && fAbneyCorrection < NEUTRAL_EPS))
     {
         return lms;
     }
@@ -612,22 +548,13 @@ float3 ApplyKhronosPBRNeutral(float3 color, float targetPeak, float compressionS
  * Restored: Classic V5.9.7-r7 C^\infty exponential soft-knee for supreme quality.
  * Bypasses lumaCoeffs entirely by utilizing invariant L+M luminance.
  * Uses dynamic transpose luma coefficients to completely eliminate intermediate RGB conversions.
- *
- * Matrix routing:
- * - scRGB and PQ: check BT.2020 boundaries
- * - sRGB: check BT.709 boundaries
  */
 float3 ApplyGamutGuardLMS(float3 lms, float knee, float3 luma_LMS_coeffs,
                           float3x3 to_RGB_boundary,
                           float2 mb_white)
 {
-    if (knee <= FLT_MIN)
-    {
-        return lms;
-    }
-
     float lm_sum = lms.r + lms.g;
-    if (lm_sum <= 0.0)
+    if (knee <= FLT_MIN || lm_sum <= 0.0)
     {
         return lms;
     }
@@ -654,22 +581,19 @@ float3 ApplyGamutGuardLMS(float3 lms, float knee, float3 luma_LMS_coeffs,
 
     float dx = chroma_offset.x;
     float dy = chroma_offset.y;
-    float wx = mb_white.x;
-    float wy = mb_white.y;
+
+    // Fast Vectorized Boundary Projection Evaluation
+    float3 A = dx * float3(to_RGB_boundary[0][0] - to_RGB_boundary[0][1],
+                           to_RGB_boundary[1][0] - to_RGB_boundary[1][1],
+                           to_RGB_boundary[2][0] - to_RGB_boundary[2][1])
+             + dy * float3(to_RGB_boundary[0][2],
+                           to_RGB_boundary[1][2],
+                           to_RGB_boundary[2][2]);
 
     float t_max = 1e10;
-
-    float A0 = dx * (to_RGB_boundary[0][0] - to_RGB_boundary[0][1]) + dy * to_RGB_boundary[0][2];
-    float B0 = wx * (to_RGB_boundary[0][0] - to_RGB_boundary[0][1]) + to_RGB_boundary[0][1] + wy * to_RGB_boundary[0][2];
-    if (A0 < -FLT_MIN) t_max = min(t_max, -B0 / A0);
-
-    float A1 = dx * (to_RGB_boundary[1][0] - to_RGB_boundary[1][1]) + dy * to_RGB_boundary[1][2];
-    float B1 = wx * (to_RGB_boundary[1][0] - to_RGB_boundary[1][1]) + to_RGB_boundary[1][1] + wy * to_RGB_boundary[1][2];
-    if (A1 < -FLT_MIN) t_max = min(t_max, -B1 / A1);
-
-    float A2 = dx * (to_RGB_boundary[2][0] - to_RGB_boundary[2][1]) + dy * to_RGB_boundary[2][2];
-    float B2 = wx * (to_RGB_boundary[2][0] - to_RGB_boundary[2][1]) + to_RGB_boundary[2][1] + wy * to_RGB_boundary[2][2];
-    if (A2 < -FLT_MIN) t_max = min(t_max, -B2 / A2);
+    if (A.x < -FLT_MIN) t_max = min(t_max, -0.5 / A.x);
+    if (A.y < -FLT_MIN) t_max = min(t_max, -0.5 / A.y);
+    if (A.z < -FLT_MIN) t_max = min(t_max, -0.5 / A.z);
 
     float max_purity = t_max * purity;
     float threshold = max_purity * (1.0 - knee);
@@ -793,11 +717,10 @@ float3 HueToRGB(float hue)
     return float3(1.0, 1.0, 1.0);
 }
 
-float ComputeBleachingK(float3 color, float strength, float3x3 to_LMS)
+float ComputeBleachingKLMS(float3 lms, float strength)
 {
     if (strength <= NEUTRAL_EPS) return 1.0;
 
-    float3 lms = mul(to_LMS, color);
     float lm_sum = lms.r + lms.g;
     if (lm_sum <= 0.0) return 1.0;
 
@@ -828,12 +751,58 @@ float ComputeCompressionRatio(float3 color, float targetPeak, float compressionS
 }
 
 // =================================================================================================
+// 9. Custom Vertex Shader (Saves CPU/GPU Matrix & Luma Vector evaluations per pixel)
+// =================================================================================================
+
+		struct VS_Output
+		{
+		    float4 vpos : SV_Position;
+		    float2 texcoord : TEXCOORD0;
+		    nointerpolation float3 wbScale : TEXCOORD1;
+		    nointerpolation float3 luma_LMS_coeffs : TEXCOORD3;
+		};
+		
+		VS_Output VS_PhotorealHDR(uint id : SV_VertexID)
+		{
+		    VS_Output output;
+		    
+		    // Efficient procedural full-screen triangle generation
+		    output.texcoord.x = (id == 2) ? 2.0 : 0.0;
+		    output.texcoord.y = (id == 1) ? 2.0 : 0.0;
+		    output.vpos = float4(output.texcoord * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+		
+		    int space = (iColorSpaceOverride > 0) ? iColorSpaceOverride : BUFFER_COLOR_SPACE;
+		    float3 lumaCoeffs = (space >= 3) ? Luma2020 : Luma709;
+			// Fix: Use a standard if-else block to bypass the HLSL matrix ternary limitation
+		    float3x3 to_RGB;
+		    if (space >= 3)
+		    {
+		        to_RGB = LMS_to_RGB2020;	
+		    }
+		    else
+		    {
+		        to_RGB = LMS_to_RGB709;
+		    }	
+		    // Hoist the dynamic transpose matrix projection out of pixel loop
+		    output.luma_LMS_coeffs = mul(lumaCoeffs, to_RGB);
+		
+		    // Hoist the entire constant white-balance configuration calculation
+		    float3 wbStops = 0.35 * float3(fTemperature + fTint, -fTint, -fTemperature + fTint);
+		    float3 wbScale = exp2(wbStops);
+		    float3 d65_wb_rgb = mul(to_RGB, wbScale);
+		    float lumaScale   = dot(d65_wb_rgb, lumaCoeffs);
+		    output.wbScale    = wbScale / max(lumaScale, FLT_MIN);
+		
+		    return output;
+		}
+
+// =================================================================================================
 // 10. Main Pipeline Shader
 // =================================================================================================
 
-void PS_PhotorealHDR(float4 vpos : SV_Position, float2 texcoord : TEXCOORD, out float4 fragColor : SV_Target)
+void PS_PhotorealHDR(VS_Output input, out float4 fragColor : SV_Target)
 {
-    int2 pos   = int2(vpos.xy);
+    int2 pos   = int2(input.vpos.xy);
     float4 src = tex2Dfetch(SamplerBackBuffer, pos);
 
     int space         = (iColorSpaceOverride > 0) ? iColorSpaceOverride : BUFFER_COLOR_SPACE;
@@ -854,12 +823,10 @@ void PS_PhotorealHDR(float4 vpos : SV_Position, float2 texcoord : TEXCOORD, out 
         return;
     }
 
-    // Decode & Sanitize (Physiological NaN Healing to neutral 18% gray)
+    // Decode & Sanitize (Branchless Physiological NaN Healing)
     float3 original_lin = DecodeToLinear(src.rgb, space);
-    if (any(IsNan3(original_lin)) || any(IsInf3(original_lin))) 
-    {
-        original_lin = float3(0.18, 0.18, 0.18) * whitePt;
-    }
+    bool is_invalid = any(IsNan3(original_lin)) || any(IsInf3(original_lin));
+    original_lin = is_invalid ? (0.18 * whitePt).xxx : original_lin;
 
     float3x3 to_LMS, to_RGB;
     [branch]
@@ -886,10 +853,6 @@ void PS_PhotorealHDR(float4 vpos : SV_Position, float2 texcoord : TEXCOORD, out 
 
     float2 mb_white = MB_WHITE_D65;
 
-    // Precompute LMS-domain luma coefficients dynamically (exact transpose representation)
-    // Eliminates three float3x3 matrix multiplications from the pipeline.
-    float3 luma_LMS_coeffs = mul(lumaCoeffs, to_RGB);
-
     // ---------------------------------------------------------------------------------------------
     // CONVERT TO LMS DOMAIN (1st forward matrix multiplication)
     // ---------------------------------------------------------------------------------------------
@@ -898,7 +861,7 @@ void PS_PhotorealHDR(float4 vpos : SV_Position, float2 texcoord : TEXCOORD, out 
     // ---------------------------------------------------------------------------------------------
     // STAGE 1: EXPOSURE & WHITE BALANCE (LMS Domain)
     // ---------------------------------------------------------------------------------------------
-    lms = ApplyLMSWhiteBalanceLMS(lms, fTemperature, fTint, lumaCoeffs, to_RGB);
+    lms *= input.wbScale;
 
     if (abs(fExposure) > NEUTRAL_EPS) 
     {
@@ -911,7 +874,7 @@ void PS_PhotorealHDR(float4 vpos : SV_Position, float2 texcoord : TEXCOORD, out 
     float3 lms_pre_grading = lms; 
     
     // Exact LMS-domain single-cycle dot product
-    float luma = dot(lms_pre_grading, luma_LMS_coeffs);
+    float luma = dot(lms_pre_grading, input.luma_LMS_coeffs);
 
     float bp_ratio = 1.0;
     if (fBlackPoint > NEUTRAL_EPS)
@@ -923,24 +886,21 @@ void PS_PhotorealHDR(float4 vpos : SV_Position, float2 texcoord : TEXCOORD, out 
     float contrast_ratio = 1.0;
     float graded_luma = luma * bp_ratio;
     float absLuma = abs(graded_luma);
+    
+    [branch]
     if (absLuma > FLT_MIN)
     {
         float pivot = fContrastPivot * whitePt;
         float logRatio = log2(absLuma / pivot);
 
         float x = logRatio * fContrast;
-        float a2 = 6.0;
-
-        if (x < 0.0 && abs(fShadows) > NEUTRAL_EPS)
-        {
-            float S = fShadows * 3.0;
-            x = x + S * ((x * x) / (x * x + a2));
-        }
-        else if (x > 0.0 && abs(fHighlights) > NEUTRAL_EPS)
-        {
-            float H = fHighlights * 3.0;
-            x = x + H * ((x * x) / (x * x + a2));
-        }
+        
+        // Branchless Stop-Domain Highlight and Shadow recovery selection
+        float S = fShadows * 3.0;
+        float H = fHighlights * 3.0;
+        float rational_factor = (x * x) / (x * x + 6.0);
+        float recovery = (x < 0.0) ? S : H;
+        x += recovery * rational_factor;
 
         float contrastLuma = pivot * exp2(x);
         float ratio = contrastLuma / absLuma;
@@ -955,7 +915,7 @@ void PS_PhotorealHDR(float4 vpos : SV_Position, float2 texcoord : TEXCOORD, out 
     // STAGE 3: BIOLOGICAL HIGHLIGHT BLEACHING (LMS Domain)
     // ---------------------------------------------------------------------------------------------
     float3 lms_pre_bleach = lms;
-    lms = ApplyTrolandBleachingLMS(lms, fBleaching, mb_white);
+    lms = ApplyTrolandBleachingLMS(lms, fBleaching);
 
     // ---------------------------------------------------------------------------------------------
     // STAGE 4: KHRONOS COMPRESSION (RGB Domain, 2nd matrix multiplication)
@@ -979,11 +939,11 @@ void PS_PhotorealHDR(float4 vpos : SV_Position, float2 texcoord : TEXCOORD, out 
     // ---------------------------------------------------------------------------------------------
     lms = mul(to_LMS, color);
 
-    lms = ApplyMBPurityLMS(lms, fSaturation, luma_LMS_coeffs, mb_white);
+    lms = ApplyMBPurityLMS(lms, fSaturation, input.luma_LMS_coeffs, mb_white);
 
     if (fGamutGuardKnee > NEUTRAL_EPS)
     {
-        lms = ApplyGamutGuardLMS(lms, fGamutGuardKnee, luma_LMS_coeffs, to_RGB_boundary, mb_white);
+        lms = ApplyGamutGuardLMS(lms, fGamutGuardKnee, input.luma_LMS_coeffs, to_RGB_boundary, mb_white);
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -991,10 +951,8 @@ void PS_PhotorealHDR(float4 vpos : SV_Position, float2 texcoord : TEXCOORD, out 
     // ---------------------------------------------------------------------------------------------
     color = mul(to_RGB, lms);
 
-    if (any(IsNan3(color)) || any(IsInf3(color))) 
-    {
-        color = original_lin;
-    }
+    is_invalid = any(IsNan3(color)) || any(IsInf3(color));
+    color = is_invalid ? original_lin : color;
 
     // ---------------------------------------------------------------------------------------------
     // DEBUG VISUALIZATION
@@ -1018,8 +976,7 @@ void PS_PhotorealHDR(float4 vpos : SV_Position, float2 texcoord : TEXCOORD, out 
         }
         else if (iDebugMode == 3)
         {
-            float3 rgb_pre_bleach = mul(to_RGB, lms_pre_bleach);
-            float k = ComputeBleachingK(rgb_pre_bleach, fBleaching, to_LMS);
+            float k = ComputeBleachingKLMS(lms_pre_bleach, fBleaching);
             debug_out = lerp(float3(1.0, 0.0, 0.0), float3(0.0, 0.3, 1.0), saturate(k));
         }
         else if (iDebugMode == 4)
@@ -1151,9 +1108,7 @@ technique PhotorealHDR_Mastering_V597r9 <
 {
     pass
     {
-        VertexShader      = PostProcessVS;
+        VertexShader      = VS_PhotorealHDR;
         PixelShader       = PS_PhotorealHDR;
-        VertexCount       = 3;
-        PrimitiveTopology = TRIANGLELIST;
     }
 }
