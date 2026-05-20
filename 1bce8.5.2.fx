@@ -72,17 +72,17 @@ static const float3 Luma2020               = float3(0.2627, 0.6780, 0.0593);
 
 // Oklab Matrices (Björn Ottosson 2020)
 static const float3x3 RGB709_to_LMS = float3x3(
-    0.4122214708, 0.5363325363, 0.0514459929,
-    0.2119034982, 0.6806995451, 0.1073969566,
-    0.0883024619, 0.2817188376, 0.6299787005
+    0.4122214708,  0.5363325363,  0.0514459929,
+    0.2119034982,  0.6806995451,  0.1073969566,
+    0.0883024619,  0.2817188376,  0.6299787005
 );
 
 // Corrected & Row-Sum-Normalized Rec.2020 -> LMS
 // Enforces exact LMS(1,1,1) for D65 white (bit-exact achromatic neutrality)
 static const float3x3 RGB2020_to_LMS = float3x3(
-    0.616759697, 0.360188024, 0.023052279,
-    0.265131674, 0.635851580, 0.099016746,
-    0.100127915, 0.203878384, 0.695993701
+    0.616759697,  0.360188024,  0.023052279,
+    0.265131674,  0.635851580,  0.099016746,
+    0.100127915,  0.203878384,  0.695993701
 );
 
 static const float3x3 LMS_to_Oklab = float3x3(
@@ -380,8 +380,7 @@ float PowSafe(float base, float exponent)
 
 float PowNonNegPreserveZero(float x, float e)
 {
-    if (x <= 0.0) return 0.0;
-    return pow(x, e);
+    return (x <= 0.0) ? 0.0 : pow(x, e);
 }
 
 float3 PowNonNegPreserveZero3(float3 x, float e)
@@ -406,10 +405,8 @@ float TrueSmoothstep(float edge0, float edge1, float x)
     return t * t * (3.0 - 2.0 * t);
 }
 
-bool IsNanVal(float x)   { return (asuint(x) & 0x7FFFFFFF) > 0x7F800000; }
-bool IsInfVal(float x)   { return (asuint(x) & 0x7FFFFFFF) == 0x7F800000; }
-bool3 IsNan3(float3 v)   { return bool3(IsNanVal(v.x), IsNanVal(v.y), IsNanVal(v.z)); }
-bool3 IsInf3(float3 v)   { return bool3(IsInfVal(v.x), IsInfVal(v.y), IsInfVal(v.z)); }
+bool3 IsNan3(float3 v) { return (asuint(v) & 0x7FFFFFFFu) > 0x7F800000u; }
+bool3 IsInf3(float3 v) { return (asuint(v) & 0x7FFFFFFFu) == 0x7F800000u; }
 
 // ==============================================================================
 // 5. Color Science (Exact Standard Definitions)
@@ -516,8 +513,6 @@ float GetResolvedWhitePoint()
 float2 GetOklabChroma(float3 linearRGB, int activeSpace)
 {
     float3x3 m;
-    
-    [branch]
     if (activeSpace >= 3)
     {
         m = RGB2020_to_LMS;
@@ -607,9 +602,9 @@ void PS_PrePass(float4 vpos : SV_Position, out float4 outData : SV_Target)
     int space = (iColorSpaceOverride > 0) ? iColorSpaceOverride : BUFFER_COLOR_SPACE;
 
     float3 color_lin = DecodeToLinear(tex2Dfetch(SamplerBackBuffer, pos).rgb);
-    if (any(IsNan3(color_lin)) || any(IsInf3(color_lin))) color_lin = 0.0;
+    bool is_invalid = any(IsNan3(color_lin)) || any(IsInf3(color_lin));
+    color_lin = is_invalid ? 0.0.xxx : color_lin;
     
-    // Note: Implicitly relies on same ColorSpace logic resolution
     float luma_lin = GetLuminanceCS(color_lin);
 
     float safe_luma = max(luma_lin, FLT_MIN);
@@ -628,7 +623,6 @@ void PS_PrePass(float4 vpos : SV_Position, out float4 outData : SV_Target)
 // 8. Analysis & Edge Detection (Planar LDS Optimized)
 // ==============================================================================
 
-// Split from float4 gs_LinearData to eliminate LDS bank conflicts on AMD GCN/RDNA & NVIDIA architectures
 groupshared float gs_Log2Luma[LDS_TILE_SIZE * LDS_TILE_SIZE];
 groupshared float gs_ChromaA[LDS_TILE_SIZE * LDS_TILE_SIZE];
 groupshared float gs_ChromaB[LDS_TILE_SIZE * LDS_TILE_SIZE];
@@ -722,7 +716,6 @@ float LaplacianOfGaussianShared(int2 local_center)
             response += luma * LoG_Kernel[idx];
         }
     }
-    // 0.00390625 is 1/256 normalization for the LoG kernel peak response squared
     return response * response * 0.00390625;
 }
 
@@ -787,8 +780,6 @@ float ChromaEdgeShared(int2 local_center)
     float ct = saturate((center_luma - CHROMA_RELIABILITY_START) * INV_CHROMA_RELIABILITY_SPAN);
     float center_reliability = ct * ct * (3.0 - 2.0 * ct);
 
-    if (center_reliability <= 0.0) return 0.0;
-
     float maxChromaDiff = 0.0;
 
     [unroll] 
@@ -805,11 +796,8 @@ float ChromaEdgeShared(int2 local_center)
             float neighbor_reliability = nt * nt * (3.0 - 2.0 * nt);
             float chroma_reliability = center_reliability * neighbor_reliability;
 
-            if (chroma_reliability > 0.0) 
-            {
-                float2 d = center_ab - float2(gs_ChromaA[neighbor_idx], gs_ChromaB[neighbor_idx]);
-                maxChromaDiff = max(maxChromaDiff, dot(d, d) * chroma_reliability);
-            }
+            float2 d = center_ab - float2(gs_ChromaA[neighbor_idx], gs_ChromaB[neighbor_idx]);
+            maxChromaDiff = max(maxChromaDiff, dot(d, d) * chroma_reliability);
         }
     }
     return maxChromaDiff * 12.0;
@@ -881,7 +869,6 @@ void WriteDebugOut(int2 pos, float3 dbg, float alpha)
  * Implicit Contract - Expects the following variables in the outer scope:
  * - float log2_center, inv_2_sigma_s_sq, inv_2_sigma_r_sq, inv_2_sigma_c_sq
  * - float spatial_y
- * - bool use_chroma
  * - float center_chroma_reliability
  * - float2 center_chroma
  * - float2 stats_log, stats_sq, stats_w
@@ -894,15 +881,12 @@ void WriteDebugOut(int2 pos, float3 dbg, float alpha)
     float _d_luma = log2_center - _n_log;                                                                                  \
     float _exponent = -(float((x_coord) * (x_coord)) * inv_2_sigma_s_sq + spatial_y) - (_d_luma * _d_luma * inv_2_sigma_r_sq); \
     [branch]                                                                                                               \
-    if (use_chroma)                                                                                                        \
+    if (bChromaAwareBilateral)                                                                                             \
     {                                                                                                                      \
         float _nt = saturate((_n_luma - CHROMA_RELIABILITY_START) * INV_CHROMA_RELIABILITY_SPAN);                          \
         float _chroma_reliability = center_chroma_reliability * (_nt * _nt * (3.0 - 2.0 * _nt));                           \
-        if (_chroma_reliability > 0.0)                                                                                     \
-        {                                                                                                                  \
-            float2 _d_chroma = center_chroma - (n_data).gb;                                                                \
-            _exponent -= (dot(_d_chroma, _d_chroma) * inv_2_sigma_c_sq) * _chroma_reliability;                             \
-        }                                                                                                                  \
+        float2 _d_chroma = center_chroma - (n_data).gb;                                                                    \
+        _exponent -= (dot(_d_chroma, _d_chroma) * inv_2_sigma_c_sq) * _chroma_reliability;                                 \
     }                                                                                                                      \
     if (_exponent > LN_FLT_MIN)                                                                                            \
     {                                                                                                                      \
@@ -911,12 +895,12 @@ void WriteDebugOut(int2 pos, float3 dbg, float alpha)
         float _t = stats_log.x + _val;                                                                                     \
         stats_log.y += (abs(stats_log.x) >= abs(_val)) ? ((stats_log.x - _t) + _val) : ((_val - _t) + stats_log.x);        \
         stats_log.x = _t;                                                                                                  \
-        _val = _n_log * _n_log * _weight;                                                                                  \
-        _t = stats_sq.x + _val;                                                                                            \
-        stats_sq.y += (abs(stats_sq.x) >= abs(_val)) ? ((stats_sq.x - _t) + _val) : ((_val - _t) + stats_sq.x);            \
+        float _val_sq = _n_log * _n_log * _weight;                                                                         \
+        _t = stats_sq.x + _val_sq;                                                                                         \
+        stats_sq.y += (stats_sq.x >= _val_sq) ? ((stats_sq.x - _t) + _val_sq) : ((_val_sq - _t) + stats_sq.x);              \
         stats_sq.x = _t;                                                                                                   \
         _t = stats_w.x + _weight;                                                                                          \
-        stats_w.y += (abs(stats_w.x) >= abs(_weight)) ? ((stats_w.x - _t) + _weight) : ((_weight - _t) + stats_w.x);       \
+        stats_w.y += (stats_w.x >= _weight) ? ((stats_w.x - _t) + _weight) : ((_weight - _t) + stats_w.x);                  \
         stats_w.x = _t;                                                                                                    \
         min_log = min(min_log, _n_log);                                                                                    \
         max_log = max(max_log, _n_log);                                                                                    \
@@ -944,7 +928,7 @@ void CS_BilateralContrast(uint3 id : SV_DispatchThreadID, uint3 tid : SV_GroupTh
             int ly = tid.y + j * 16;
             int2 fetch_pos = base_pos + int2(lx, ly);
             
-            fetch_pos = max(0, min(int2(BUFFER_WIDTH, BUFFER_HEIGHT) - 1, fetch_pos));
+            fetch_pos = max(int2(0, 0), min(int2(BUFFER_WIDTH, BUFFER_HEIGHT) - 1, fetch_pos));
             float4 val = tex2Dfetch(SamplerLinearData, fetch_pos);
             int idx = GS_IDX(lx, ly);
             gs_Log2Luma[idx] = val.r;
@@ -975,10 +959,9 @@ void CS_BilateralContrast(uint3 id : SV_DispatchThreadID, uint3 tid : SV_GroupTh
     float luma_lin    = gs_LumaLin[center_idx];
     float whitePt     = GetResolvedWhitePoint();
     
-    // Double decode from v8.4.6 is intentionally retained here for 
-    // exact original behavior without requiring an extra render target.
     float3 color_lin  = DecodeToLinear(src.rgb);
-    if (any(IsNan3(color_lin)) || any(IsInf3(color_lin))) color_lin = 0.0;
+    bool is_invalid = any(IsNan3(color_lin)) || any(IsInf3(color_lin));
+    color_lin = is_invalid ? 0.0.xxx : color_lin;
 
     if (iDebugMode == 0 && luma_lin <= FLT_MIN) 
     {
@@ -1070,13 +1053,11 @@ void CS_BilateralContrast(uint3 id : SV_DispatchThreadID, uint3 tid : SV_GroupTh
 
     float2 center_chroma = float2(gs_ChromaA[center_idx], gs_ChromaB[center_idx]);
     float center_chroma_reliability = 0.0;
-    bool use_chroma = false;
 
     if (bChromaAwareBilateral) 
     {
         float ct = saturate((luma_lin - CHROMA_RELIABILITY_START) * INV_CHROMA_RELIABILITY_SPAN);
         center_chroma_reliability = ct * ct * (3.0 - 2.0 * ct);
-        use_chroma = (center_chroma_reliability > 0.0);
     }
 
     float2 stats_log = 0.0;
