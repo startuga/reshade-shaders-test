@@ -450,7 +450,7 @@ float2 ApplyAbneyCorrection(float2 mb_chroma, float2 mb_white, float strength)
     // In MB space, blue occupies the upper-left quadrant (angle ~1.8 to 2.5 rad).
     // Compensate by rotating the hue angle back toward cyan/green, proportional to purity and strength.
     float shift = sin(angle - 0.8) * 0.15 * r * strength;
-    angle -= shift;
+    angle += shift;
 
     return mb_white + float2(cos(angle), sin(angle)) * r;
 }
