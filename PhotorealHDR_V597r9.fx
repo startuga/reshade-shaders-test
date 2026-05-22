@@ -266,7 +266,7 @@ uniform int iColorSpaceOverride <
     ui_type     = "combo";
     ui_label    = "Color Space Override";
     ui_items    = "Auto (Default)\0sRGB (SDR)\0scRGB (HDR Linear)\0HDR10 (PQ)\0";
-    ui_tooltip  = "Must match Bilateral Contrast v8.4.4+.";
+    ui_tooltip  = "Must match Bilateral Contrast.";
     ui_category = "System";
 > = 0;
 
@@ -317,8 +317,8 @@ float SqrtIEEE(float x)
     return sqrt(max(x, 0.0));
 }
 
-bool3 IsNan3(float3 v)   { return (asuint(v) & 0x7FFFFFFFu) > 0x7F800000u; }
-bool3 IsInf3(float3 v)   { return (asuint(v) & 0x7FFFFFFFu) == 0x7F800000u; }
+bool3 IsNan3(float3 v) { return (asuint(v) & 0x7FFFFFFFu) > 0x7F800000u; }
+bool3 IsInf3(float3 v) { return (asuint(v) & 0x7FFFFFFFu) == 0x7F800000u; }
 
 // =================================================================================================
 // 5. Color Science & EOTF Utilities
@@ -398,30 +398,6 @@ float3 MB_to_LMS(float3 mb)
 // =================================================================================================
 
 /**
- * ApplyAbneyCorrection
- *
- * Compensates for the Abney Effect (the physiological hue shift where blue colors naturally 
- * appear redder/more violet as saturation grows). By applying an inverse rotation in the foveal 
- * MacLeod-Boynton chromaticity plane, we preserve a constant perceived hue, ensuring blue 
- * stays a pure spectral blue.
- */
-float2 ApplyAbneyCorrection(float2 mb_chroma, float2 mb_white, float strength)
-{
-    float2 offset = mb_chroma - mb_white;
-    float r = SqrtIEEE(dot(offset, offset));
-
-    float angle = atan2(offset.y, offset.x);
-    
-    // In MB space, blue occupies the upper-left quadrant (angle ~1.8 to 2.5 rad).
-    // Compensate by rotating the hue angle back toward cyan/green, proportional to purity and strength.
-    float shift = sin(angle - 0.8) * 0.15 * r * strength;
-    angle += shift;
-
-    float2 corrected = mb_white + float2(cos(angle), sin(angle)) * r;
-    return (strength <= NEUTRAL_EPS || r < FLT_MIN) ? mb_chroma : corrected;
-}
-
-/**
  * ComputeBlackPointRatio
  *
  * Computes the subtractive black-point ratio.
@@ -433,15 +409,13 @@ float ComputeBlackPointRatio(float luma, float bpNits, float shadowFloor)
     float t = saturate(luma / max(4.0 * bpNits, FLT_MIN));
     float smooth_t = t * t * (3.0 - 2.0 * t);
 
-    float ratio = lerp(shadowFloor, raw, smooth_t);
-    return (bpNits <= FLT_MIN) ? 1.0 : ratio;
+    return lerp(shadowFloor, raw, smooth_t);
 }
 
 /**
  * Troland Bleaching (LMS-In / LMS-Out)
  *
  * Simulates cone photopigment bleaching under intense retinal illuminance.
- * Operates strictly in the LMS domain and utilizes direct linear interpolation.
  */
 float3 ApplyTrolandBleachingLMS(float3 lms, float strength)
 {
@@ -458,16 +432,20 @@ float3 ApplyTrolandBleachingLMS(float3 lms, float strength)
 }
 
 /**
- * MacLeod-Boynton Isoluminant Purity (LMS-In / LMS-Out)
+ * ApplyMBPurityAndGamutGuardLMS (UNIFIED CONE CHROMATICITY STAGE)
  *
- * Implements the vivid-color protection ceiling uniformly.
- * Integrates Abney Hue Compensation to guarantee hue invariance during saturation changes.
- * Uses dynamic transpose luma coefficients to completely eliminate intermediate RGB conversions.
+ * This function unifies Saturation/Purity Scaling, Abney Hue Compensation, 
+ * and Gamut Guard Soft-Knee Compression into a single coordinate round trip.
+ * 
+ * Incorporates the gamut-aware "Relative Purity" concept from RenoDX PsychoV-17:
+ * - Calculates the exact distance to the boundary ($t_{\text{clip}}$) at the current hue angle.
+ * - Uses the Relative Purity ($r / t_{\text{clip}}$) to scale the Abney Effect shift.
+ * - This provides perfectly uniform, gamut-neutral compensation across all quadrants.
  */
-float3 ApplyMBPurityLMS(float3 lms, float purity_scale, float3 luma_LMS_coeffs, float2 mb_white)
+float3 ApplyMBPurityAndGamutGuardLMS(float3 lms, float purity_scale, float knee, float3 luma_LMS_coeffs, float3x3 to_RGB_boundary, float2 mb_white)
 {
     float lm_sum = lms.r + lms.g;
-    if (lm_sum <= 0.0 || (abs(purity_scale - 1.0) < NEUTRAL_EPS && fAbneyCorrection < NEUTRAL_EPS))
+    if (lm_sum <= 0.0)
     {
         return lms;
     }
@@ -486,8 +464,32 @@ float3 ApplyMBPurityLMS(float3 lms, float purity_scale, float3 luma_LMS_coeffs, 
     float2 chroma_offset = mb.xy - mb_white;
     float purity = SqrtIEEE(dot(chroma_offset, chroma_offset));
 
-    float effective_scale = purity_scale;
+    if (purity < FLT_MIN)
+    {
+        return lms;
+    }
 
+    // Ray-trace boundary intersection distance dynamically (vectorized evaluation)
+    float dx = chroma_offset.x;
+    float dy = chroma_offset.y;
+
+    float3 A = dx * float3(to_RGB_boundary[0][0] - to_RGB_boundary[0][1],
+                           to_RGB_boundary[1][0] - to_RGB_boundary[1][1],
+                           to_RGB_boundary[2][0] - to_RGB_boundary[2][1])
+             + dy * float3(to_RGB_boundary[0][2],
+                           to_RGB_boundary[1][2],
+                           to_RGB_boundary[2][2]);
+
+    float t_max = 1e10;
+    if (A.x < -FLT_MIN) t_max = min(t_max, -0.5 / A.x);
+    if (A.y < -FLT_MIN) t_max = min(t_max, -0.5 / A.y);
+    if (A.z < -FLT_MIN) t_max = min(t_max, -0.5 / A.z);
+
+    // Compute relative purity (distance relative to boundary limit: 1.0 / t_max)
+    float relative_purity = saturate(1.0 / max(t_max, FLT_MIN));
+
+    // Saturating/Purity Scaling
+    float effective_scale = purity_scale;
     if (purity_scale > 1.0)
     {
         float protection_t = saturate(purity / MB_PURITY_PROTECTION_CEILING);
@@ -501,16 +503,55 @@ float3 ApplyMBPurityLMS(float3 lms, float purity_scale, float3 luma_LMS_coeffs, 
     }
 
     effective_scale = lerp(1.0, effective_scale, chroma_reliability);
-    mb.xy = lerp(mb_white, mb.xy, effective_scale);
+    float2 scaled_chroma_offset = chroma_offset * effective_scale;
 
-    // Apply physiological Abney compensation during saturation shifts
-    mb.xy = ApplyAbneyCorrection(mb.xy, mb_white, fAbneyCorrection * chroma_reliability);
+    // Physiological Abney Hue Compensation scaled by Relative Purity (perceived saturation)
+    if (fAbneyCorrection > NEUTRAL_EPS)
+    {
+        float angle = atan2(chroma_offset.y, chroma_offset.x);
+        float shift = sin(angle - 0.8) * 0.15 * relative_purity * fAbneyCorrection * chroma_reliability;
+        angle += shift;
 
+        float scaled_purity = SqrtIEEE(dot(scaled_chroma_offset, scaled_chroma_offset));
+        scaled_chroma_offset = float2(cos(angle), sin(angle)) * scaled_purity;
+    }
+
+    // Analytical Soft-Knee Gamut Guard Compression
+    if (knee > FLT_MIN)
+    {
+        float corrected_purity = SqrtIEEE(dot(scaled_chroma_offset, scaled_chroma_offset));
+        float max_purity = t_max * purity;
+        float threshold = max_purity * (1.0 - knee);
+
+        if (corrected_purity > threshold && threshold > FLT_MIN)
+        {
+            float excess = corrected_purity - threshold;
+            float headroom = max_purity - threshold;
+
+            float compressed = threshold + headroom * (1.0 - exp(-excess / max(headroom, FLT_MIN)));
+            scaled_chroma_offset = (scaled_chroma_offset / max(corrected_purity, FLT_MIN)) * compressed;
+
+            // Enforce hard-clamp fallback on gamut violation
+            mb.xy = mb_white + scaled_chroma_offset;
+            float3 lms_compressed = MB_to_LMS(mb);
+            float3 boundary_check = mul(to_RGB_boundary, lms_compressed);
+            float min_b = min(min(boundary_check.r, boundary_check.g), boundary_check.b);
+            if (min_b < 0.0)
+            {
+                float2 mb_now = mb.xy - mb_white;
+                float  p_now  = SqrtIEEE(dot(mb_now, mb_now));
+                float  p_safe = max_purity * (1.0 - NEUTRAL_EPS);
+                scaled_chroma_offset = mb_now * (p_safe / max(p_now, FLT_MIN));
+            }
+        }
+    }
+
+    mb.xy = mb_white + scaled_chroma_offset;
     return MB_to_LMS(mb);
 }
 
 // =================================================================================================
-// 7. Tonemapping & Gamut Functions
+// 7. Tonemapping Functions
 // =================================================================================================
 
 float3 ApplyKhronosPBRNeutral(float3 color, float targetPeak, float compressionStart, float desatStrength)
@@ -540,93 +581,6 @@ float3 ApplyKhronosPBRNeutral(float3 color, float targetPeak, float compressionS
     }
 
     return color;
-}
-
-/**
- * Analytical MB Gamut Guard (LMS-In / LMS-Out)
- *
- * Restored: Classic V5.9.7-r7 C^\infty exponential soft-knee for supreme quality.
- * Bypasses lumaCoeffs entirely by utilizing invariant L+M luminance.
- * Uses dynamic transpose luma coefficients to completely eliminate intermediate RGB conversions.
- */
-float3 ApplyGamutGuardLMS(float3 lms, float knee, float3 luma_LMS_coeffs,
-                          float3x3 to_RGB_boundary,
-                          float2 mb_white)
-{
-    float lm_sum = lms.r + lms.g;
-    if (knee <= FLT_MIN || lm_sum <= 0.0)
-    {
-        return lms;
-    }
-
-    // Direct LMS-domain luma evaluation (0 conversions!)
-    float luma = dot(lms, luma_LMS_coeffs);
-    float ct = saturate((luma - CHROMA_RELIABILITY_START) * INV_CHROMA_RELIABILITY_SPAN);
-    float reliability = ct * ct * (3.0 - 2.0 * ct);
-    if (reliability <= 0.0)
-    {
-        return lms;
-    }
-
-    float3 mb = LMS_to_MB(lms);
-    float2 chroma_offset = mb.xy - mb_white;
-    float purity_sq = dot(chroma_offset, chroma_offset);
-
-    if (purity_sq < FLT_MIN)
-    {
-        return lms;
-    }
-
-    float purity = SqrtIEEE(purity_sq);
-
-    float dx = chroma_offset.x;
-    float dy = chroma_offset.y;
-
-    // Fast Vectorized Boundary Projection Evaluation
-    float3 A = dx * float3(to_RGB_boundary[0][0] - to_RGB_boundary[0][1],
-                           to_RGB_boundary[1][0] - to_RGB_boundary[1][1],
-                           to_RGB_boundary[2][0] - to_RGB_boundary[2][1])
-             + dy * float3(to_RGB_boundary[0][2],
-                           to_RGB_boundary[1][2],
-                           to_RGB_boundary[2][2]);
-
-    float t_max = 1e10;
-    if (A.x < -FLT_MIN) t_max = min(t_max, -0.5 / A.x);
-    if (A.y < -FLT_MIN) t_max = min(t_max, -0.5 / A.y);
-    if (A.z < -FLT_MIN) t_max = min(t_max, -0.5 / A.z);
-
-    float max_purity = t_max * purity;
-    float threshold = max_purity * (1.0 - knee);
-
-    float3 lms_out = lms;
-
-    if (purity > threshold && threshold > FLT_MIN)
-    {
-        float excess = purity - threshold;
-        float headroom = max_purity - threshold;
-
-        // V5.9.7-r7 C^\infty Exponential Soft-Knee
-        float compressed = threshold + headroom * (1.0 - exp(-excess / max(headroom, FLT_MIN)));
-        float scale = compressed / max(purity, FLT_MIN);
-
-        mb.xy = mb_white + chroma_offset * scale;
-        float3 lms_compressed = MB_to_LMS(mb);
-
-        float3 boundary_check = mul(to_RGB_boundary, lms_compressed);
-        float min_b = min(min(boundary_check.r, boundary_check.g), boundary_check.b);
-        if (min_b < 0.0)
-        {
-            float2 mb_now = mb.xy - mb_white;
-            float  p_now  = SqrtIEEE(dot(mb_now, mb_now));
-            float  p_safe = max_purity * (1.0 - NEUTRAL_EPS);
-            mb.xy = mb_white + mb_now * (p_safe / max(p_now, FLT_MIN));
-            lms_compressed = MB_to_LMS(mb);
-        }
-
-        lms_out = lms_compressed;
-    }
-
-    return lms_out;
 }
 
 // =================================================================================================
@@ -732,6 +686,12 @@ float ComputeBleachingKLMS(float3 lms, float strength)
     return lerp(1.0, availability, saturate(strength));
 }
 
+float3 ApplyMBPurityLMS_DUMMY(float3 lms, float purity_scale, float3 luma_LMS_coeffs, float2 mb_white)
+{
+    // Dummy used for debug paths where we only need purity visualization
+    return ApplyMBPurityAndGamutGuardLMS(lms, purity_scale, 0.0, luma_LMS_coeffs, RGB709_to_LMS, mb_white);
+}
+
 float ComputeCompressionRatio(float3 color, float targetPeak, float compressionStart)
 {
     float3 safeColor = max(color, 0.0);
@@ -754,47 +714,47 @@ float ComputeCompressionRatio(float3 color, float targetPeak, float compressionS
 // 9. Custom Vertex Shader (Saves CPU/GPU Matrix & Luma Vector evaluations per pixel)
 // =================================================================================================
 
-		struct VS_Output
-		{
-		    float4 vpos : SV_Position;
-		    float2 texcoord : TEXCOORD0;
-		    nointerpolation float3 wbScale : TEXCOORD1;
-		    nointerpolation float3 luma_LMS_coeffs : TEXCOORD3;
-		};
-		
-		VS_Output VS_PhotorealHDR(uint id : SV_VertexID)
-		{
-		    VS_Output output;
-		    
+struct VS_Output
+{
+    float4 vpos : SV_Position;
+    float2 texcoord : TEXCOORD0;
+    nointerpolation float3 wbScale : TEXCOORD1;
+    nointerpolation float3 luma_LMS_coeffs : TEXCOORD3;
+};
+
+VS_Output VS_PhotorealHDR(uint id : SV_VertexID)
+{
+    VS_Output output;
+    
 		    // Efficient procedural full-screen triangle generation
-		    output.texcoord.x = (id == 2) ? 2.0 : 0.0;
-		    output.texcoord.y = (id == 1) ? 2.0 : 0.0;
-		    output.vpos = float4(output.texcoord * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
-		
-		    int space = (iColorSpaceOverride > 0) ? iColorSpaceOverride : BUFFER_COLOR_SPACE;
-		    float3 lumaCoeffs = (space >= 3) ? Luma2020 : Luma709;
+    output.texcoord.x = (id == 2) ? 2.0 : 0.0;
+    output.texcoord.y = (id == 1) ? 2.0 : 0.0;
+    output.vpos = float4(output.texcoord * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+
+    int space = (iColorSpaceOverride > 0) ? iColorSpaceOverride : BUFFER_COLOR_SPACE;
+    float3 lumaCoeffs = (space >= 3) ? Luma2020 : Luma709;
 			// Fix: Use a standard if-else block to bypass the HLSL matrix ternary limitation
-		    float3x3 to_RGB;
-		    if (space >= 3)
-		    {
-		        to_RGB = LMS_to_RGB2020;	
-		    }
-		    else
-		    {
-		        to_RGB = LMS_to_RGB709;
-		    }	
+    float3x3 to_RGB;
+    if (space >= 3)
+    {
+        to_RGB = LMS_to_RGB2020;
+    }
+    else
+    {
+        to_RGB = LMS_to_RGB709;
+    }
 		    // Hoist the dynamic transpose matrix projection out of pixel loop
-		    output.luma_LMS_coeffs = mul(lumaCoeffs, to_RGB);
-		
+    output.luma_LMS_coeffs = mul(lumaCoeffs, to_RGB);
+
 		    // Hoist the entire constant white-balance configuration calculation
-		    float3 wbStops = 0.35 * float3(fTemperature + fTint, -fTint, -fTemperature + fTint);
-		    float3 wbScale = exp2(wbStops);
-		    float3 d65_wb_rgb = mul(to_RGB, wbScale);
-		    float lumaScale   = dot(d65_wb_rgb, lumaCoeffs);
-		    output.wbScale    = wbScale / max(lumaScale, FLT_MIN);
-		
-		    return output;
-		}
+    float3 wbStops = 0.35 * float3(fTemperature + fTint, -fTint, -fTemperature + fTint);
+    float3 wbScale = exp2(wbStops);
+    float3 d65_wb_rgb = mul(to_RGB, wbScale);
+    float lumaScale   = dot(d65_wb_rgb, lumaCoeffs);
+    output.wbScale    = wbScale / max(lumaScale, FLT_MIN);
+
+    return output;
+}
 
 // =================================================================================================
 // 10. Main Pipeline Shader
@@ -894,7 +854,6 @@ void PS_PhotorealHDR(VS_Output input, out float4 fragColor : SV_Target)
         float logRatio = log2(absLuma / pivot);
 
         float x = logRatio * fContrast;
-        
         // Branchless Stop-Domain Highlight and Shadow recovery selection
         float S = fShadows * 3.0;
         float H = fHighlights * 3.0;
@@ -935,19 +894,14 @@ void PS_PhotorealHDR(VS_Output input, out float4 fragColor : SV_Target)
     }
 
     // ---------------------------------------------------------------------------------------------
-    // STAGE 5: PURITY & GAMUT GUARD (LMS Domain, 3rd matrix multiplication)
+    // STAGE 5 & 6: PURITY & GAMUT GUARD (UNIFIED CONE CHROMATICITY STAGE, 3rd matrix multiplication)
     // ---------------------------------------------------------------------------------------------
     lms = mul(to_LMS, color);
 
-    lms = ApplyMBPurityLMS(lms, fSaturation, input.luma_LMS_coeffs, mb_white);
-
-    if (fGamutGuardKnee > NEUTRAL_EPS)
-    {
-        lms = ApplyGamutGuardLMS(lms, fGamutGuardKnee, input.luma_LMS_coeffs, to_RGB_boundary, mb_white);
-    }
+    lms = ApplyMBPurityAndGamutGuardLMS(lms, fSaturation, fGamutGuardKnee, input.luma_LMS_coeffs, to_RGB_boundary, mb_white);
 
     // ---------------------------------------------------------------------------------------------
-    // STAGE 6: FINAL RGB RECONSTRUCTION (RGB Domain, 4th matrix multiplication)
+    // STAGE 7: FINAL RGB RECONSTRUCTION (RGB Domain, 4th matrix multiplication)
     // ---------------------------------------------------------------------------------------------
     color = mul(to_RGB, lms);
 
@@ -1068,7 +1022,7 @@ void PS_PhotorealHDR(VS_Output input, out float4 fragColor : SV_Target)
     }
 
     // ---------------------------------------------------------------------------------------------
-    // STAGE 7: ENCODE & OUTPUT
+    // STAGE 8: ENCODE & OUTPUT
     // ---------------------------------------------------------------------------------------------
     float3 encoded = EncodeFromLinear(color, space);
 
@@ -1089,6 +1043,8 @@ technique PhotorealHDR_Mastering_V597r9 <
     ui_label = "Photoreal HDR V5.9.7-r9 (Production LMS Optimized)";
     ui_tooltip = "Photorealistic grading for SDR and HDR.\n\n"
                  "V5.9.7-r9 changes:\n"
+                 "  - Unified Saturation & Gamut Guard pipeline (eliminates redundant LMS-MB round trips).\n"
+                 "  - Integrated RenoDX PsychoV-17 'Relative Purity' calculation for gamut-aware Abney compensation.\n"
                  "  - Fully re-structured LMS-integrated pipeline (reduced Mat-Muls from 9 to 4).\n"
                  "  - Implemented LMS-domain luma coefficients transpose calculation to save 3 more mat-muls.\n"
                  "  - Cleaned up dead functions GetLuminanceCS and GetResolvedWhitePoint.\n"
@@ -1101,9 +1057,8 @@ technique PhotorealHDR_Mastering_V597r9 <
                  "  3. Filmic Contrast & Tonal EQ (stop-domain, C1 rational capped to 100.0)\n"
                  "  4. Biological Highlight Bleaching (Troland depletion, LMS-contained)\n"
                  "  5. Khronos PBR Neutral Highlight Compression\n"
-                 "  6. MacLeod-Boynton Isoluminant Saturation (Abney-compensated)\n"
-                 "  7. Analytical MB Gamut Guard (hue-preserving, exponential soft-knee)\n\n"
-                 "Companion shader: Bilateral Contrast v8.5.2+";
+                 "  6. MacLeod-Boynton Unified Saturation & Gamut Guard (Hue-preserving, Abney-relative, soft-knee)\n\n"
+                 "Companion shader: Bilateral Contrast";
 >
 {
     pass
