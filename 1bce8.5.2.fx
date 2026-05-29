@@ -192,7 +192,7 @@ sampler2D SamplerBilateralOut
 #endif
 
 // ==============================================================================
-// 3. UI Parameters
+// 3. UI Parameters (Adjusted for 3D Punch & Noise Protection)
 // ==============================================================================
 
 uniform int iQualityPreset <
@@ -207,28 +207,28 @@ uniform float fStrength <
     ui_label = "Contrast Strength";
     ui_min = 0.0; ui_max = 5.0; ui_step = 0.001;
     ui_category = "Core Settings";
-> = 3.0;
+> = 3.2; // Adjusted: Higher base scalar to increase structural 3D pop
 
 uniform float fShadowProtection <
     ui_type = "slider";
     ui_label = "Shadow Protection";
     ui_min = 0.0; ui_max = 1.0; ui_step = 0.001;
     ui_category = "Protection Zones";
-> = 0.15;
+> = 0.35; // Adjusted: Keeps the filter from elevating low-SNR shadow dither noise
 
 uniform float fMidtoneProtection <
     ui_type = "slider";
     ui_label = "Midtone Protection";
     ui_min = 0.0; ui_max = 1.0; ui_step = 0.001;
     ui_category = "Protection Zones";
-> = 0;
+> = 0.05; // Adjusted: Gentle buffer for midtone grain
 
 uniform float fHighlightProtection <
     ui_type = "slider";
     ui_label = "Highlight Protection";
     ui_min = 0.0; ui_max = 1.0; ui_step = 0.001;
     ui_category = "Protection Zones";
-> = 0.10;
+> = 0.15; // Adjusted: Protects bright regions and specular structures
 
 uniform float fZoneWhitePoint <
     ui_type = "slider";
@@ -244,7 +244,7 @@ uniform float fNegativeProtection <
     ui_min = 0.0; ui_max = 1.0; ui_step = 0.001;
     ui_tooltip = "Protects out-of-gamut negative RGB values created or preserved by ratio scaling.\nWorks in all color spaces (SDR and HDR).";
     ui_category = "Protection Zones";
-> = 0;
+> = 0.25; // Adjusted: Prevents sub-pixel sharpening offsets from creating high-frequency colored sparkles
 
 uniform bool bAdaptiveStrength <
     ui_label = "Enable Adaptive Strength";
@@ -256,14 +256,14 @@ uniform int iAdaptiveMode <
     ui_label = "Adaptive Mode";
     ui_items = "Dynamic Range\0Variance\0Hybrid\0Range-Variance Hybrid\0";
     ui_category = "Adaptive Processing";
-> = 3;
+> = 3; // Hybrid: Uses local range & variance to damp sharpening inside flat, noisy fields
 
 uniform float fAdaptiveAmount <
     ui_type = "slider";
     ui_label = "Adaptive Amount";
     ui_min = 0.0; ui_max = 1.0; ui_step = 0.001;
     ui_category = "Adaptive Processing";
-> = 0.35;
+> = 0.45; // Adjusted: Aggressively damps sharpening in high-variance flat/grain regions
 
 uniform float fAdaptiveCurve <
     ui_type = "slider";
@@ -277,21 +277,21 @@ uniform int iRadius <
     ui_label = "Filter Radius";
     ui_min = 1; ui_max = 32;
     ui_category = "Filter Parameters";
-> = 8;
+> = 8; //12; Adjusted: Volumetric 3D punch; moves filtering away from pixel-sized noise to large-scale objects
 
 uniform float fSigmaSpatial <
     ui_type = "slider";
     ui_label = "Spatial Sigma";
     ui_min = 0.1; ui_max = 32.0; ui_step = 0.01;
     ui_category = "Filter Parameters";
-> = 3.0;
+> = 4.50; // Adjusted: Matches wider radius to build macro-depth
 
 uniform float fSigmaRange <
     ui_type = "slider";
     ui_label = "Range Sigma (Stops)";
     ui_min = 0.01; ui_max = 4.0; ui_step = 0.001;
     ui_category = "Filter Parameters";
-> = 0.45;
+> = 0.55; // Adjusted: Prevents the filter from trapping on high-frequency noise spikes; preserves boundaries but smooths out grain
 
 uniform float fSigmaChroma <
     ui_type = "slider";
@@ -299,12 +299,12 @@ uniform float fSigmaChroma <
     ui_min = 0.01; ui_max = 1.0; ui_step = 0.001;
     ui_tooltip = "Controls filter sensitivity to Oklab chromaticity differences.\nTypical perceptible shift: 0.05-0.15 in (a/L, b/L) space.";
     ui_category = "Filter Parameters";
-> = 0.12;
+> = 0.15; // Adjusted: Dampens color-noise/chroma-grain amplification
 
 uniform bool bChromaAwareBilateral <
     ui_label = "Chroma-Aware Filtering";
     ui_category = "Filter Parameters";
-> = true;
+> = false;
 
 uniform bool bAdaptiveRadius <
     ui_label = "Adaptive Radius";
@@ -324,21 +324,21 @@ uniform float fChromaEdgeStrength <
     ui_min = 0.0; ui_max = 1.0; ui_step = 0.01;
     ui_tooltip = "Controls how strongly chroma edges reduce the filter radius.\n0.0 = Luma only. 1.0 = Max(Luma, Oklab Chroma).";
     ui_category = "Adaptive Radius";
-> = 0.60;
+> = 0.50; // Adjusted: Prevents locking onto high-frequency color artifacts
 
 uniform int iEdgeDetectionMethod <
     ui_type = "combo";
     ui_label = "Edge Detection Method";
     ui_items = "Sobel 3x3\0Scharr 3x3\0Prewitt 3x3\0Sobel 5x5\0Laplacian of Gaussian\0Structure Tensor\0";
     ui_category = "Adaptive Radius";
-> = 5;
+> = 5; // Structure Tensor: Uses Gaussian weight pre-filtering, making it immune to single-pixel noise
 
 uniform float fGradientSensitivity <
     ui_type = "slider";
     ui_label = "Gradient Sensitivity";
     ui_min = 10.0; ui_max = 500.0; ui_step = 1.0;
     ui_category = "Advanced Tuning";
-> = 200.0;
+> = 160.0; // Adjusted: Reduced sensitivity to prevent pixel-level micro-noise gradients from scaling the filter
 
 uniform float fVarianceWeight <
     ui_type = "slider";
