@@ -34,7 +34,7 @@
 // Set to 1: True IEEE 754 precision (Mastering Standard - No precision loss)
 // Set to 0: 16-bit Float (Faster, uses 50% less VRAM, minor sub-pixel precision loss)
 #ifndef PREPASS_USE_RGBA32F
-    #define PREPASS_USE_RGBA32F 1
+    #define PREPASS_USE_RGBA32F 0
 #endif
 
 #if PREPASS_USE_RGBA32F
@@ -284,7 +284,7 @@ uniform float fSigmaSpatial <
     ui_label = "Spatial Sigma";
     ui_min = 0.1; ui_max = 32.0; ui_step = 0.01;
     ui_category = "Filter Parameters";
-> = 4.50; // Adjusted: Matches wider radius to build macro-depth
+> = 3.00; // Adjusted: Matches wider radius to build macro-depth
 
 uniform float fSigmaRange <
     ui_type = "slider";
@@ -299,12 +299,12 @@ uniform float fSigmaChroma <
     ui_min = 0.01; ui_max = 1.0; ui_step = 0.001;
     ui_tooltip = "Controls filter sensitivity to Oklab chromaticity differences.\nTypical perceptible shift: 0.05-0.15 in (a/L, b/L) space.";
     ui_category = "Filter Parameters";
-> = 0.15; // Adjusted: Dampens color-noise/chroma-grain amplification
+> = 0.05; // Adjusted: Dampens color-noise/chroma-grain amplification
 
 uniform bool bChromaAwareBilateral <
     ui_label = "Chroma-Aware Filtering";
     ui_category = "Filter Parameters";
-> = false;
+> = true;
 
 uniform bool bAdaptiveRadius <
     ui_label = "Adaptive Radius";
