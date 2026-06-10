@@ -427,7 +427,7 @@ float3 ApplyTrolandBleachingLMS(float3 lms, float strength)
     float availability = 1.0 / (1.0 + (stim_lm / max(TROLAND_HALF_SAT, FLT_MIN)));
     float k = lerp(1.0, availability, saturate(strength));
 
-    float3 bleached = lerp(0.5 * lm_sum, lms, k);
+    float3 bleached = lerp((0.5 * lm_sum).xxx, lms, k); // Fix: Explicit scalar-to-vector promotion
     return (lm_sum <= 0.0) ? lms : bleached;
 }
 
