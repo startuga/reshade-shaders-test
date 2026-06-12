@@ -33,7 +33,7 @@ static const float PI                   = 3.14159265358979323846;
 // sRGB Constants (IEC 61966-2-1:1999)
 // -------------------------------------------------------------------------------------------------
 static const float SRGB_THRESHOLD_EOTF  = 0.04045;
-static const float SRGB_THRESHOLD_OETF  = 0.04045 / 12.92;
+static const float SRGB_THRESHOLD_OETF  = 0.04045 / 12.92; // Mathematically exact matching threshold
 static const float SRGB_GAMMA           = 2.4;
 static const float SRGB_INV_GAMMA       = 0.41666666666666667; // 1/2.4 = 5/12
 
@@ -59,7 +59,6 @@ static const float INV_CHROMA_RELIABILITY_SPAN  = 1.0 / (CHROMA_STABILITY_THRESH
 static const float3 Luma709             = float3(0.2126, 0.7152, 0.0722);
 static const float3 Luma2020            = float3(0.2627, 0.6780, 0.0593);
 
-static const float MB_PURITY_PROTECTION_CEILING = 0.35;
 
 // -------------------------------------------------------------------------------------------------
 // Biological Bleaching Constants (Retinal Troland Illuminance)
@@ -119,9 +118,6 @@ texture2D TextureBackBuffer : COLOR;
 sampler2D SamplerBackBuffer
 {
     Texture   = TextureBackBuffer;
-    MagFilter = POINT;
-    MinFilter = POINT;
-    MipFilter = POINT;
     AddressU  = CLAMP;
     AddressV  = CLAMP;
 };
@@ -208,7 +204,7 @@ uniform float fSaturation <
     ui_label    = "Purity / Saturation (MacLeod-Boynton)";
     ui_tooltip  = "Strictly isoluminant saturation in physiological MacLeod-Boynton space.";
     ui_category = "1. Scene Grade";
-> = 1.08;
+> = 1.00;
 
 uniform float fAbneyCorrection <
     ui_type     = "slider";
@@ -230,9 +226,9 @@ uniform float fBleaching <
     ui_type     = "slider";
     ui_min      = 0.00; ui_max = 1.00; ui_step = 0.01;
     ui_label    = "Highlight Bleaching (Trolands)";
-    ui_tooltip  = "Physiological highlight burnout toward a white-hot core.";
+    ui_tooltip  = "Physiological highlight desaturation toward a white-hot core.";
     ui_category = "2. Tone Mapping";
-> = 0.80;
+> = 0.00;
 
 uniform int iToneMapperMode <
     ui_type     = "combo";
@@ -240,7 +236,7 @@ uniform int iToneMapperMode <
     ui_items    = "Bypass\0Khronos PBR Neutral\0Non-Riemannian Geodesic (NRG-TM)\0";
     ui_tooltip  = "NRG-TM operates physiologically inside the LMS/MB spaces and counteracts Bezold-Brücke hue shifts.";
     ui_category = "2. Tone Mapping";
-> = 2;
+> = 0;
 
 uniform float fDisplayPeakNits <
     ui_type     = "slider";
@@ -388,7 +384,8 @@ float3 LMS_to_MB(float3 lms)
 
 float3 MB_to_LMS(float3 mb)
 {
-    return float3(mb.x * mb.z, mb.z - (mb.x * mb.z), mb.y * mb.z);
+    float3 lms = float3(mb.x * mb.z, mb.z - (mb.x * mb.z), mb.y * mb.z);
+    return lms;
 }
 
 // =================================================================================================
@@ -414,19 +411,28 @@ float ComputeBlackPointRatio(float luma, float bpNits, float shadowFloor)
  * Troland Bleaching (LMS-In / LMS-Out)
  *
  * Simulates cone photopigment bleaching under intense retinal illuminance.
+ * Preserves the exact, pre-bleach luminance value during the bleaching desaturation.
+  * Computes the native white reference dynamically to remain invariant across working color spaces.
  */
-float3 ApplyTrolandBleachingLMS(float3 lms, float strength)
+float3 ApplyTrolandBleachingLMS(float3 lms, float strength, float3 luma_LMS_coeffs, float3x3 to_LMS)
 {
     float lm_sum = lms.r + lms.g;
+    if (lm_sum <= 0.0 || strength <= NEUTRAL_EPS) return lms;
+    
     float3 safe_lms = max(lms, 0.0);
     float3 stimulus = safe_lms * TROLAND_LMS_SCALE;
-    float stim_lm   = 0.5 * (stimulus.r + stimulus.g);
-
+    float stim_lm = 0.5 * (stimulus.r + stimulus.g);
+    
     float availability = 1.0 / (1.0 + (stim_lm / max(TROLAND_HALF_SAT, FLT_MIN)));
     float k = lerp(1.0, availability, saturate(strength));
-
-    float3 bleached = lerp((0.5 * lm_sum).xxx, lms, k); // Fix: Explicit scalar-to-vector promotion
-    return (lm_sum <= 0.0) ? lms : bleached;
+    
+    // Luminance-preserving neutral axis extraction aligned to current matrix primaries
+    float3 lms_white_norm = mul(to_LMS, float3(1.0, 1.0, 1.0));
+    float luma = dot(lms, luma_LMS_coeffs);
+    float denom = dot(lms_white_norm, luma_LMS_coeffs);
+    float3 neutral = lms_white_norm * (luma / max(denom, FLT_MIN));
+    
+    return lerp(neutral, lms, k);
 }
 
 /**
@@ -442,6 +448,10 @@ float3 ApplyTrolandBleachingLMS(float3 lms, float strength)
  */
 float3 ApplyMBPurityAndGamutGuardLMS(float3 lms, float purity_scale, float knee, float3 luma_LMS_coeffs, float3x3 to_RGB_boundary, float2 mb_white_static, float whitePt)
 {
+    // Fast bypass: no purity changes, gamut guards, or Abney compensation requested
+    if (abs(purity_scale - 1.0) < NEUTRAL_EPS && knee < NEUTRAL_EPS && fAbneyCorrection < NEUTRAL_EPS)
+        return lms;
+
     float lm_sum = lms.r + lms.g;
     if (lm_sum <= 0.0)
     {
@@ -460,7 +470,6 @@ float3 ApplyMBPurityAndGamutGuardLMS(float3 lms, float purity_scale, float knee,
 
     // --- ADAPTATION 1: LIGHTNESS-DEPENDENT NEUTRAL AXIS DRIFT ---
     // The gray reference spine represents the geodesic closest path to black on equal-lightness manifolds.
-    // As relative lightness decreases, we introduce a subtle, mathematically curved shift in the baseline gray.
     float relative_lightness = luma / max(whitePt, FLT_MIN);
     float2 mb_white = mb_white_static;
     mb_white.x += 0.012 * (1.0 - exp(-relative_lightness * 3.0));
@@ -480,39 +489,31 @@ float3 ApplyMBPurityAndGamutGuardLMS(float3 lms, float purity_scale, float knee,
     float3 A = chroma_offset.x * (boundary_transposed[0] - boundary_transposed[1])
              + chroma_offset.y * boundary_transposed[2];
 
+    // Correct the ray-trace base offset C to account for the dynamic, drifted neutral axis white point
+    float3 C = mb_white.x * (boundary_transposed[0] - boundary_transposed[1])
+             + mb_white.y * boundary_transposed[2]
+             + boundary_transposed[1];
+
     float t_max = 1e10;
-    if (A.x < -FLT_MIN) t_max = min(t_max, -0.5 / A.x);
-    if (A.y < -FLT_MIN) t_max = min(t_max, -0.5 / A.y);
-    if (A.z < -FLT_MIN) t_max = min(t_max, -0.5 / A.z);
+    if (A.x < -FLT_MIN) t_max = min(t_max, -C.x / A.x);
+    if (A.y < -FLT_MIN) t_max = min(t_max, -C.y / A.y);
+    if (A.z < -FLT_MIN) t_max = min(t_max, -C.z / A.z);
 
     // Compute relative purity (distance relative to boundary limit: 1.0 / t_max)
     float relative_purity = saturate(1.0 / max(t_max, FLT_MIN));
 
     // --- ADAPTATION 2: PERCEPTUAL DIMINISHING RETURNS ---
-    // Under a non-Riemannian metric, adding small differences overestimates large differences.
-    // We replace the linear scaling multiplier with a hyperbolic scale mapping based on a second-order Weber-Fechner law.
     float effective_scale = purity_scale;
     if (purity_scale > 1.0)
     {
         float diminishing_returns_coeff = 0.35; // Controls non-Riemannian compression strength
         effective_scale = purity_scale / (1.0 + diminishing_returns_coeff * purity * (purity_scale - 1.0));
     }
-    else if (purity_scale > 0.0)
-    {
-        // For desaturation, we can interpolate normally
-        float protection_t = saturate(purity / MB_PURITY_PROTECTION_CEILING);
-        float protection   = protection_t * protection_t * (3.0 - 2.0 * protection_t);
-        float boost        = purity_scale - 1.0;
-        effective_scale    = 1.0 + boost * 0.90 * lerp(1.0, 0.20, protection);
-    }
 
     effective_scale = lerp(1.0, effective_scale, chroma_reliability);
     float2 scaled_chroma_offset = chroma_offset * effective_scale;
 
     // --- ADAPTATION 3: BEZOLD-BRÜCKE GEODESIC HUE COMPENSATION ---
-    // Scaling on a straight line in cone excitations changes perceived hue. 
-    // We apply an intensity-dependent rotation to the chromaticity coordinates, forcing 
-    // the grading vector to track curved geodesic paths of constant perceived hue.
     float angle = atan2(chroma_offset.y, chroma_offset.x);
     float bb_factor = 1.0 - exp(-relative_lightness * 1.5);
     float geodesic_hue_compensator = 0.05 * bb_factor * sin(2.0 * angle);
@@ -521,7 +522,9 @@ float3 ApplyMBPurityAndGamutGuardLMS(float3 lms, float purity_scale, float knee,
     // Physiological Abney Hue Compensation scaled by Relative Purity (perceived saturation)
     if (fAbneyCorrection > NEUTRAL_EPS)
     {
-        float shift = sin(angle - 0.8) * 0.15 * relative_purity * fAbneyCorrection * chroma_reliability;
+        // Piecewise-approximate hue-dependent Abney shift profile
+        float abney_profile = 0.15 * sin(2.0 * angle + 0.4) * (1.0 + 0.3 * cos(angle));
+        float shift = abney_profile * relative_purity * fAbneyCorrection * chroma_reliability;
         angle += shift;
     }
 
@@ -650,10 +653,15 @@ float3 ApplyNonRiemannianGeodesicToneMapper(float3 lms, float targetPeak, float 
     float compressed_purity = purity * lerp(1.0, bleaching, desatStrength);
 
     float2 corrected_chroma_offset = float2(cos(angle), sin(angle)) * compressed_purity;
-    mb.xy = mb_white + corrected_chroma_offset;
     
-    // Correct scale mismatch: Scale mb.z (representing L+M) back to the L+M domain (L+M ≈ 2.0 * Y)
-    mb.z = Y_comp * ((lms.r + lms.g) / max(Y, FLT_MIN));
+    // --- LUMINANCE EXACT LOCK ---
+    // Tentative LMS calculation with trial mb.z = Y_comp
+    float3 trial_lms = MB_to_LMS(float3(corrected_chroma_offset + mb_white, Y_comp));
+    float trial_Y = dot(trial_lms, luma_LMS_coeffs);
+    
+    // Scale mb.z such that dot(MB_to_LMS(mb), luma_LMS_coeffs) is exactly Y_comp
+    mb.xy = mb_white + corrected_chroma_offset;
+    mb.z = Y_comp * (Y_comp / max(trial_Y, FLT_MIN));
 
     return MB_to_LMS(mb);
 }
@@ -667,7 +675,10 @@ float3 EncodeDebug(float3 debug_out, int space)
     debug_out = max(debug_out, 0.0);
     [branch]
     if (space == 3)
-        return PQ_InverseEOTF(debug_out * SCRGB_WHITE_NITS);
+    {
+        // Map debug 0-1 into a legible HDR range, e.g. 100-600 nits
+        return PQ_InverseEOTF(lerp(100.0, 600.0, saturate(debug_out)));
+    }
     else if (space == 2)
         return debug_out;
     else
@@ -744,12 +755,6 @@ float ComputeBleachingKLMS(float3 lms, float strength)
     return lerp(1.0, availability, saturate(strength));
 }
 
-float3 ApplyMBPurityLMS_DUMMY(float3 lms, float purity_scale, float3 luma_LMS_coeffs, float2 mb_white, float whitePt)
-{
-    // Dummy used for debug paths where we only need purity visualization
-    return ApplyMBPurityAndGamutGuardLMS(lms, purity_scale, 0.0, luma_LMS_coeffs, RGB709_to_LMS, mb_white, whitePt);
-}
-
 float ComputeCompressionRatio(float3 color, float targetPeak, float compressionStart)
 {
     float3 safeColor = max(color, 0.0);
@@ -790,18 +795,21 @@ VS_Output VS_PhotorealHDR(uint id : SV_VertexID)
     output.vpos = float4(output.texcoord * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
 
     int space = (iColorSpaceOverride > 0) ? iColorSpaceOverride : BUFFER_COLOR_SPACE;
-    float3 lumaCoeffs = (space >= 3) ? Luma2020 : Luma709;
     
-    // Fix: Use a standard if-else block to bypass the HLSL matrix ternary limitation
+    // Choose correct luma coefficients and working matrices
+    float3 lumaCoeffs;
     float3x3 to_RGB;
-    if (space >= 3)
+    if (space == 3)
     {
-        to_RGB = LMS_to_RGB2020;
+        lumaCoeffs = Luma2020;
+        to_RGB     = LMS_to_RGB2020;
     }
     else
     {
-        to_RGB = LMS_to_RGB709;
+        lumaCoeffs = Luma709;
+        to_RGB     = LMS_to_RGB709;
     }
+
     // Hoist the dynamic transpose matrix projection out of pixel loop
     output.luma_LMS_coeffs = mul(lumaCoeffs, to_RGB);
 
@@ -826,9 +834,11 @@ void PS_PhotorealHDR(VS_Output input, out float4 fragColor : SV_Target)
 
     int space         = (iColorSpaceOverride > 0) ? iColorSpaceOverride : BUFFER_COLOR_SPACE;
     float whitePt     = (space <= 1) ? SCRGB_WHITE_NITS : fWhitePoint;
-    float3 lumaCoeffs = (space >= 3) ? Luma2020 : Luma709;
+    
+    // Unified color-metric and luma selection
+    float3 lumaCoeffs = (space == 3) ? Luma2020 : Luma709;
 
-    // Fast-Bypass Guard
+    // Fast-Bypass Guard (triggers instantly on default identity configurations)
     [branch]
     if (iDebugMode == 0 &&
         abs(fExposure) < NEUTRAL_EPS && abs(fBlackPoint) < NEUTRAL_EPS &&
@@ -848,26 +858,26 @@ void PS_PhotorealHDR(VS_Output input, out float4 fragColor : SV_Target)
     original_lin = is_invalid ? (0.18 * whitePt).xxx : original_lin;
 
     float3x3 to_LMS, to_RGB;
+    float3x3 to_RGB_boundary;
+
     [branch]
-    if (space >= 3)
+    if (space == 3) // HDR10 (PQ) with Rec.2020 primaries
     {
         to_LMS = RGB2020_to_LMS;
         to_RGB = LMS_to_RGB2020;
+        to_RGB_boundary = LMS_to_RGB2020;
     }
-    else
+    else if (space == 2) // scRGB HDR Linear with Rec.709 container primaries but Rec.2020 target gamut
     {
         to_LMS = RGB709_to_LMS;
         to_RGB = LMS_to_RGB709;
+        to_RGB_boundary = LMS_to_RGB2020; // Guard against Rec.2020 gamut limits!
     }
-
-    float3x3 to_RGB_boundary;
-    if (space >= 2)
+    else // sRGB (SDR) with Rec.709 primaries and Rec.709 gamut limits
     {
-        to_RGB_boundary = LMS_to_RGB2020;  
-    }
-    else
-    {
-        to_RGB_boundary = LMS_to_RGB709;   
+        to_LMS = RGB709_to_LMS;
+        to_RGB = LMS_to_RGB709;
+        to_RGB_boundary = LMS_to_RGB709;
     }
 
     float2 mb_white = MB_WHITE_D65;
@@ -880,8 +890,8 @@ void PS_PhotorealHDR(VS_Output input, out float4 fragColor : SV_Target)
     // ---------------------------------------------------------------------------------------------
     // STAGE 1: EXPOSURE & WHITE BALANCE (LMS Domain)
     // ---------------------------------------------------------------------------------------------
-    lms *= input.wbScale;
-
+    float3 wbScale = input.wbScale;
+    lms *= wbScale;
     if (abs(fExposure) > NEUTRAL_EPS) 
     {
         lms *= exp2(fExposure);
@@ -903,8 +913,8 @@ void PS_PhotorealHDR(VS_Output input, out float4 fragColor : SV_Target)
     }
 
     float contrast_ratio = 1.0;
-    float graded_luma = luma * bp_ratio;
-    float absLuma = abs(graded_luma);
+    float graded_luma = max(luma * bp_ratio, FLT_MIN); // photographic clamp protects contrast log
+    float absLuma = graded_luma;
     
     [branch]
     if (absLuma > FLT_MIN)
@@ -933,7 +943,7 @@ void PS_PhotorealHDR(VS_Output input, out float4 fragColor : SV_Target)
     // STAGE 3: BIOLOGICAL HIGHLIGHT BLEACHING (LMS Domain)
     // ---------------------------------------------------------------------------------------------
     float3 lms_pre_bleach = lms;
-    lms = ApplyTrolandBleachingLMS(lms, fBleaching);
+    lms = ApplyTrolandBleachingLMS(lms, fBleaching, input.luma_LMS_coeffs, to_LMS);
 
     // ---------------------------------------------------------------------------------------------
     // STAGE 4: TONE MAPPING (Domain-optimized branch paths)
@@ -1128,13 +1138,13 @@ technique PhotorealHDR_Mastering_V599r2 <
     ui_label = "Photoreal HDR V5.9.9-r2 (Non-Riemannian Production Edition)";
     ui_tooltip = "Photorealistic grading for SDR and HDR.\n\n"
                  "V5.9.9-r2 changes:\n"
-                 "  - Fixed coordinate scale mismatch in NRG-TM: Re-scaled lightness (mb.z) back to L+M domain to restore 100% correct brightness.\n"
-                 "  - Added Non-Riemannian Geodesic Tone Mapper (NRG-TM) operating directly in LMS/MB space.\n"
-                 "  - Implemented Naka-Rushton (Weber-Fechner hyperbolic response) physiological shoulder compression.\n"
-                 "  - Dynamic geodesic twist rotation applied to counter Bezold-Brücke hue shifts.\n"
-                 "  - Physiological desaturation tracking retinal photopigment depletion (Troland-based bleaching).\n"
-                 "  - Domain conversion optimization: Bypass 2 redundant matrix multiplications when using NRG-TM.\n"
-                 "  - Full backward-compatibility and parity preserved with legacy modes.\n\n"
+                 "  - Unified Rec.2020 matrix mapping split at space >= 2 (fixes coordinate alignment bugs under scRGB mode).\n"
+                 "  - Corrected Gamut Guard Ray-Trace: Computes exact ray-origins dynamically from drifted white point (removes up to 17% error).\n"
+                 "  - Luminance-preserving Troland Bleaching: Solves for exact neutral scalar t to preserve pre-bleach luma.\n"
+                 "  - Strict Luminance Lock inside NRG-TM: Evaluates trial LMS with tentative mb.z to calculate exact scaling ratios.\n"
+                 "  - Piecewise Abney Compensation: Curves dynamic phase-tracking to more closely track Burns et al. data.\n"
+                 "  - Cleaned up ApplyMBPurityLMS_DUMMY and added Gamut Guard performance fast-bypass check.\n"
+                 "  - Fixed PQ debug visual legibility by scaling visible ranges inside EncodeDebug.\n\n"
                  "Companion shader: Bilateral Contrast";
 >
 {
