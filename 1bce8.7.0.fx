@@ -324,7 +324,7 @@ uniform bool bNonRiemannianPerception <
 uniform float fDiminishingReturnsExponent <
     ui_type = "slider";
     ui_label = "Perceptual Saturation Exponent";
-    ui_min = 0.5; ui_max = 2.00; ui_step = 0.01;
+    ui_min = 0.05; ui_max = 2.00; ui_step = 0.01;
     ui_tooltip = "Applies Stevens' Power Law (gamma) to the non-Riemannian metric.\n"
                  "Values < 1.0 model heavy diminishing returns (high-contrast compression).\n"
                  "1.0 = Weber-Fechner logarithmic baseline.\n"
