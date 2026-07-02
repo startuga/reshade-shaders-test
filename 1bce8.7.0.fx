@@ -324,12 +324,13 @@ uniform bool bNonRiemannianPerception <
 uniform float fDiminishingReturnsExponent <
     ui_type = "slider";
     ui_label = "Perceptual Saturation Exponent";
-    ui_min = 1.0; ui_max = 2.0; ui_step = 0.01;
-    ui_tooltip = "Controls the rate of perceptual saturation for large color differences.\n"
-                 "1.0 = Second-Order Weber-Fechner logarithmic diminishing returns.\n"
-                 "2.0 = Classical Riemannian/Gaussian model (no diminishing returns).";
+    ui_min = 0.5; ui_max = 2.00; ui_step = 0.01;
+    ui_tooltip = "Applies Stevens' Power Law (gamma) to the non-Riemannian metric.\n"
+                 "Values < 1.0 model heavy diminishing returns (high-contrast compression).\n"
+                 "1.0 = Weber-Fechner logarithmic baseline.\n"
+                 "Values > 1.0 transition the metric back toward Riemannian quadratic behavior.";
     ui_category = "Non-Riemannian Physics (2025)";
-> = 1.2;
+> = 1.0;
 
 uniform bool bAdaptiveRadius <
     ui_label = "Adaptive Radius";
@@ -922,8 +923,9 @@ void WriteDebugOut(int2 pos, float3 dbg, float alpha)
     }                                                                                                                      \
     if (bNonRiemannianPerception)                                                                                          \
     {                                                                                                                      \
-        float _log_dist = log2(1.0 + _dist_sq) * 0.69314718;                                                                \
-        _dist_sq = lerp(_log_dist, _dist_sq, saturate(fDiminishingReturnsExponent - 1.0));                                  \
+        float _gamma = fDiminishingReturnsExponent;                                                                        \
+        float _dist_pow = (_gamma == 1.0) ? _dist_sq : pow(max(_dist_sq, FLT_MIN), _gamma);                                 \
+        _dist_sq = log2(1.0 + _dist_pow) * (0.69314718 / _gamma);                                                          \
     }                                                                                                                      \
     float _exponent = -(float((x_coord) * (x_coord)) * inv_2_sigma_s_sq + spatial_y) - _dist_sq;                           \
     if (_exponent > LN_FLT_MIN)                                                                                            \
