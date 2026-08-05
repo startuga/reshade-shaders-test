@@ -479,7 +479,7 @@ float ComputeBlackPointRatio(float luma, float bpNits, float shadowFloor)
 float SolveGamutBoundaryExact(float2 chroma_direction, float3 luma_LMS_coeffs, float3x3 to_RGB_boundary, float2 mb_white)
 {
     float t_low = 0.0;
-    float t_high = 4.0; // Expanded from 4.0 to 8.0 to encompass pure Rec.2020 Blue (distance 5.21 in MB space)
+    float t_high = 8.0; // Expanded from 4.0 to 8.0 to encompass pure Rec.2020 Blue (distance 5.21 in MB space)
     
     [unroll]
     for (int iter = 0; iter < 24; iter++)
