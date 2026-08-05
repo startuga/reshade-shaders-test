@@ -479,7 +479,7 @@ float ComputeBlackPointRatio(float luma, float bpNits, float shadowFloor)
 float SolveGamutBoundaryExact(float2 chroma_direction, float3 luma_LMS_coeffs, float3x3 to_RGB_boundary, float2 mb_white)
 {
     float t_low = 0.0;
-    float t_high = 4.0; // Safely encompasses wide gamut coordinates (BT.2020 blue/green)
+    float t_high = 4.0; // Expanded from 4.0 to 8.0 to encompass pure Rec.2020 Blue (distance 5.21 in MB space)
     
     [unroll]
     for (int iter = 0; iter < 24; iter++)
@@ -553,10 +553,12 @@ float3 ApplyMBPurityAndGamutGuardLMS(float3 lms, float luma_adaptation, float pu
     float ct   = saturate((luma_adaptation - CHROMA_RELIABILITY_START) * INV_CHROMA_RELIABILITY_SPAN);
     float chroma_reliability = ct * ct * (3.0 - 2.0 * ct);
 
-    if (chroma_reliability <= 0.0) return lms;
+    if (chroma_reliability <= 0.0 && purity_scale >= 1.0) return lms;
 
-    // Consistency white point reference matching tonemapping baseline
-    float2 mb_white = GetDriftedWhitePointMB(luma_adaptation, whitePt, mb_white_static);
+    // FIX (Bug 2): Blend drifted white point back to static D65 as purity_scale approaches 0.0 
+    // to ensure pure monochromatic desaturation (R=G=B)
+    float2 mb_white_drifted = GetDriftedWhitePointMB(luma_adaptation, whitePt, mb_white_static);
+    float2 mb_white = lerp(mb_white_static, mb_white_drifted, saturate(purity_scale));
 
     float3 mb = LMS_to_MB(lms);
     float2 chroma_offset = mb.xy - mb_white;
@@ -592,13 +594,14 @@ float3 ApplyMBPurityAndGamutGuardLMS(float3 lms, float luma_adaptation, float pu
     {
         float diminishing_returns_coeff = 0.35;
         effective_scale = purity_scale / (1.0 + diminishing_returns_coeff * purity * (purity_scale - 1.0));
+        // FIX (Bug 1): Only gate saturation BOOSTS in low-reliability shadows
+        effective_scale = lerp(1.0, effective_scale, chroma_reliability);
     }
 
-    effective_scale = lerp(1.0, effective_scale, chroma_reliability);
     float corrected_purity = purity * effective_scale;
     float2 scaled_chroma_offset = shifted_chroma_dir * corrected_purity;
 
-    // Analytical Soft-Knee Gamut Guard Compression
+    // Analytical Soft-Knee Gamut Guard Compression (Master Switch: knee > 0.0)
     if (knee > FLT_MIN)
     {
         float thresh_purity = SqrtIEEE(dot(scaled_chroma_offset, scaled_chroma_offset));
@@ -611,23 +614,23 @@ float3 ApplyMBPurityAndGamutGuardLMS(float3 lms, float luma_adaptation, float pu
 
             float compressed = threshold + headroom * (1.0 - exp(-excess / max(headroom, FLT_MIN)));
             scaled_chroma_offset = (scaled_chroma_offset / max(thresh_purity, FLT_MIN)) * compressed;
+        }
 
-            // Enforce hard-clamp fallback on gamut violation
-            mb.xy = mb_white + scaled_chroma_offset;
-            float3 lms_compressed = MB_to_LMS(float3(mb.xy, luma));
-            float3 boundary_check = mul(to_RGB_boundary, lms_compressed);
-            float min_b = min(min(boundary_check.r, boundary_check.g), boundary_check.b);
-            if (min_b < 0.0)
-            {
-                float  p_now  = SqrtIEEE(dot(scaled_chroma_offset, scaled_chroma_offset));
-                float  p_safe = max_purity * (1.0 - NEUTRAL_EPS);
-                scaled_chroma_offset = scaled_chroma_offset * (p_safe / max(p_now, FLT_MIN));
-            }
+        // Hard-clamp fallback (Enforced when Gamut Guard is active)
+        mb.xy = mb_white + scaled_chroma_offset;
+        float3 lms_compressed = MB_to_LMS(float3(mb.xy, luma));
+        float3 boundary_check = mul(to_RGB_boundary, lms_compressed);
+        float min_b = min(min(boundary_check.r, boundary_check.g), boundary_check.b);
+        if (min_b < 0.0)
+        {
+            float p_now  = SqrtIEEE(dot(scaled_chroma_offset, scaled_chroma_offset));
+            float p_safe = max_purity * (1.0 - NEUTRAL_EPS);
+            scaled_chroma_offset = scaled_chroma_offset * (p_safe / max(p_now, FLT_MIN));
         }
     }
 
     mb.xy = mb_white + scaled_chroma_offset;
-    
+
     // --- LUMINANCE EXACT LOCK ---
     float3 trial_lms = MB_to_LMS(float3(mb.xy, luma));
     float trial_Y = dot(trial_lms, luma_LMS_coeffs);
