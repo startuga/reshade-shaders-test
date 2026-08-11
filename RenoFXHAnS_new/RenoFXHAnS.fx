@@ -10,7 +10,6 @@
 
 #define HANS_MODE_OFF      0
 #define HANS_MODE_AUTO_SDR 1
-#define HANS_MODE_FORCE_ON 2
 
 // Analysis runs at half resolution. The maximum analysis radius of 12 texels
 // therefore represents a 24-pixel radius in the source image.
@@ -34,9 +33,9 @@
 uniform uint HANS_MODE <
 	ui_type = "combo";
 	ui_category = "HAnS Highlight Analysis";
-	ui_items = "Off\0Auto (SDR Input)\0Force On\0";
+	ui_items = "Off\0Auto (SDR Input)\0";
 	ui_label = "Highlight Analysis";
-	ui_tooltip = "Controls per-pixel HDR Boost using the HAnS highlight detector. Auto analyzes SDR input and bypasses native HDR. Force On is experimental for HDR input.";
+	ui_tooltip = "Controls per-pixel HDR Boost using the HAnS highlight detector. Auto analyzes SDR input and bypasses native HDR. Active HAnS bypasses the global APL limiter.";
 > = HANS_MODE_AUTO_SDR;
 
 uniform float HANS_SIZE <
@@ -58,7 +57,7 @@ uniform float HANS_LOCAL_CONTRAST_THRESHOLD <
 	ui_step = 0.01;
 	ui_label = "Local Contrast Threshold";
 	ui_tooltip = "Sets how strongly a candidate must stand above its surroundings. The HAnS paper commonly uses 0.2 or 0.3 for normalized LDR input.";
-> = 0.30;
+> = 0.25;
 
 uniform float HANS_STRENGTH <
 	ui_type = "slider";
@@ -78,7 +77,7 @@ uniform float HANS_FLOOR <
 	ui_step = 1.0;
 	ui_label = "Non-Highlight Boost";
 	ui_tooltip = "Sets minimum HDR Boost availability for pixels HAnS does not identify as highlights.";
-> = 10.0;
+> = 20.0;
 
 uniform float HANS_RESPONSE_GAMMA <
 	ui_type = "slider";
@@ -200,7 +199,6 @@ groupshared float4 HAnSVerticalTile[HANS_TILE_EXTENT * HANS_GROUP_SIZE];
 
 bool HAnSShouldAnalyze() {
 	if (HANS_MODE == HANS_MODE_OFF) return false;
-	if (HANS_MODE == HANS_MODE_FORCE_ON) return true;
 	uint input_transfer = ResolveInputTransfer();
 	return input_transfer != INPUT_HDR10 && input_transfer != INPUT_SCRGB;
 }
@@ -241,6 +239,7 @@ float4 HAnSExtractFeatures(
 float4 HAnSBoxBlurHorizontal(
 		float4 position : SV_Position,
 		float2 texcoord : TexCoord) : SV_Target {
+	if (!HAnSShouldAnalyze()) return 0.0f.xxxx;
 	int radius = HAnSRadius();
 	float2 texel = HAnSTexelSize();
 	float3 sum = 0.0f.xxx;
@@ -257,6 +256,7 @@ float4 HAnSBoxBlurHorizontal(
 float4 HAnSBoxBlurVertical(
 		float4 position : SV_Position,
 		float2 texcoord : TexCoord) : SV_Target {
+	if (!HAnSShouldAnalyze()) return 0.0f.xxxx;
 	int radius = HAnSRadius();
 	float2 texel = HAnSTexelSize();
 	float3 sum = 0.0f.xxx;
@@ -273,6 +273,7 @@ float4 HAnSBoxBlurVertical(
 float4 HAnSMaxHorizontal(
 		float4 position : SV_Position,
 		float2 texcoord : TexCoord) : SV_Target {
+	if (!HAnSShouldAnalyze()) return 0.0f.xxxx;
 	int radius = HAnSRadius();
 	float2 texel = HAnSTexelSize();
 	float3 result = 0.0f.xxx;
@@ -287,6 +288,7 @@ float4 HAnSMaxHorizontal(
 float4 HAnSMaxVertical(
 		float4 position : SV_Position,
 		float2 texcoord : TexCoord) : SV_Target {
+	if (!HAnSShouldAnalyze()) return 0.0f.xxxx;
 	int radius = HAnSRadius();
 	float2 texel = HAnSTexelSize();
 	float3 result = 0.0f.xxx;
@@ -295,6 +297,7 @@ float4 HAnSMaxVertical(
 			result = max(result, tex2D(HAnSDilateHorizontalSampler, texcoord + float2(0.0f, offset * texel.y)).rgb);
 		}
 	}
+
 	return float4(result, 1.0f);
 }
 
@@ -309,7 +312,8 @@ int2 HAnSClampCoordinate(int2 coordinate) {
 void HAnSLoadHorizontalTile(
 		sampler2D source,
 		uint3 group_id,
-		uint3 group_thread_id) {
+		uint3 group_thread_id,
+		bool should_analyze) {
 	uint linear_thread = group_thread_id.y * HANS_GROUP_SIZE
 			+ group_thread_id.x;
 	for (uint load = 0; load < 4; load++) {
@@ -319,16 +323,17 @@ void HAnSLoadHorizontalTile(
 		int2 source_coordinate = int2(
 				int(group_id.x * HANS_GROUP_SIZE + tile_x) - HANS_MAX_RADIUS,
 				int(group_id.y * HANS_GROUP_SIZE + tile_y));
-		HAnSHorizontalTile[tile_y * HANS_TILE_EXTENT + tile_x] = tex2Dfetch(
-				source,
-				HAnSClampCoordinate(source_coordinate));
+		HAnSHorizontalTile[tile_y * HANS_TILE_EXTENT + tile_x] = should_analyze
+				? tex2Dfetch(source, HAnSClampCoordinate(source_coordinate))
+				: 0.0f.xxxx;
 	}
 }
 
 void HAnSLoadVerticalTile(
 		sampler2D source,
 		uint3 group_id,
-		uint3 group_thread_id) {
+		uint3 group_thread_id,
+		bool should_analyze) {
 	uint linear_thread = group_thread_id.y * HANS_GROUP_SIZE
 			+ group_thread_id.x;
 	for (uint load = 0; load < 4; load++) {
@@ -338,9 +343,9 @@ void HAnSLoadVerticalTile(
 		int2 source_coordinate = int2(
 				int(group_id.x * HANS_GROUP_SIZE + tile_x),
 				int(group_id.y * HANS_GROUP_SIZE + tile_y) - HANS_MAX_RADIUS);
-		HAnSVerticalTile[tile_y * HANS_GROUP_SIZE + tile_x] = tex2Dfetch(
-				source,
-				HAnSClampCoordinate(source_coordinate));
+		HAnSVerticalTile[tile_y * HANS_GROUP_SIZE + tile_x] = should_analyze
+				? tex2Dfetch(source, HAnSClampCoordinate(source_coordinate))
+				: 0.0f.xxxx;
 	}
 }
 
@@ -349,10 +354,16 @@ void HAnSBoxBlurHorizontalCS(
 		uint3 dispatch_thread_id : SV_DispatchThreadID,
 		uint3 group_id : SV_GroupID,
 		uint3 group_thread_id : SV_GroupThreadID) {
-	HAnSLoadHorizontalTile(HAnSFeatureSampler, group_id, group_thread_id);
+	bool should_analyze = HAnSShouldAnalyze();
+	HAnSLoadHorizontalTile(
+			HAnSFeatureSampler,
+			group_id,
+			group_thread_id,
+			should_analyze);
 	barrier();
 
-	if (dispatch_thread_id.x < HANS_ANALYSIS_WIDTH
+	if (should_analyze
+			&& dispatch_thread_id.x < HANS_ANALYSIS_WIDTH
 			&& dispatch_thread_id.y < HANS_ANALYSIS_HEIGHT) {
 		int radius = HAnSRadius();
 		float3 sum = 0.0f.xxx;
@@ -376,10 +387,16 @@ void HAnSBoxBlurVerticalCS(
 		uint3 dispatch_thread_id : SV_DispatchThreadID,
 		uint3 group_id : SV_GroupID,
 		uint3 group_thread_id : SV_GroupThreadID) {
-	HAnSLoadVerticalTile(HAnSBlurHorizontalSampler, group_id, group_thread_id);
+	bool should_analyze = HAnSShouldAnalyze();
+	HAnSLoadVerticalTile(
+			HAnSBlurHorizontalSampler,
+			group_id,
+			group_thread_id,
+			should_analyze);
 	barrier();
 
-	if (dispatch_thread_id.x < HANS_ANALYSIS_WIDTH
+	if (should_analyze
+			&& dispatch_thread_id.x < HANS_ANALYSIS_WIDTH
 			&& dispatch_thread_id.y < HANS_ANALYSIS_HEIGHT) {
 		int radius = HAnSRadius();
 		float3 sum = 0.0f.xxx;
@@ -404,10 +421,16 @@ void HAnSMaxHorizontalCS(
 		uint3 dispatch_thread_id : SV_DispatchThreadID,
 		uint3 group_id : SV_GroupID,
 		uint3 group_thread_id : SV_GroupThreadID) {
-	HAnSLoadHorizontalTile(HAnSBlurSampler, group_id, group_thread_id);
+	bool should_analyze = HAnSShouldAnalyze();
+	HAnSLoadHorizontalTile(
+			HAnSBlurSampler,
+			group_id,
+			group_thread_id,
+			should_analyze);
 	barrier();
 
-	if (dispatch_thread_id.x < HANS_ANALYSIS_WIDTH
+	if (should_analyze
+			&& dispatch_thread_id.x < HANS_ANALYSIS_WIDTH
 			&& dispatch_thread_id.y < HANS_ANALYSIS_HEIGHT) {
 		int radius = HAnSRadius();
 		float3 result = 0.0f.xxx;
@@ -432,10 +455,16 @@ void HAnSMaxVerticalCS(
 		uint3 dispatch_thread_id : SV_DispatchThreadID,
 		uint3 group_id : SV_GroupID,
 		uint3 group_thread_id : SV_GroupThreadID) {
-	HAnSLoadVerticalTile(HAnSDilateHorizontalSampler, group_id, group_thread_id);
+	bool should_analyze = HAnSShouldAnalyze();
+	HAnSLoadVerticalTile(
+			HAnSDilateHorizontalSampler,
+			group_id,
+			group_thread_id,
+			should_analyze);
 	barrier();
 
-	if (dispatch_thread_id.x < HANS_ANALYSIS_WIDTH
+	if (should_analyze
+			&& dispatch_thread_id.x < HANS_ANALYSIS_WIDTH
 			&& dispatch_thread_id.y < HANS_ANALYSIS_HEIGHT) {
 		int radius = HAnSRadius();
 		float3 result = 0.0f.xxx;
