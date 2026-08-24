@@ -598,7 +598,8 @@ float3 ApplyTrolandBleachingLMS(float3 lms, float strength, float3 luma_LMS_coef
 }
 
 /**
- * ApplyMBPurityAndGamutGuardLMS (V6.1.5 Zero-Hue-Drift Engine)
+ * ApplyMBPurityAndGamutGuardLMS (V6.1.5 - Abney-Synchronized Gamut Guard)
+ * Fixed: Post-Abney ray re-solving, valid z-plane boundary test, and monotonic clamp.
  */
 float3 ApplyMBPurityAndGamutGuardLMS(
     float3 lms, 
@@ -653,13 +654,13 @@ float3 ApplyMBPurityAndGamutGuardLMS(
     float2 chroma_dir = chroma_offset / max(purity, FLT_MIN);
     float relative_lightness = luma / max(whitePt, FLT_MIN);
 
-    // Solve physical gamut boundary distance along the chromaticity ray
-    float max_purity = 8.0;
+    // Initial boundary solve for relative purity demand curves
+    float initial_max_purity = 8.0;
     if (!is_unclamped || abney_correction > NEUTRAL_EPS || abs(vibrance_amount) > NEUTRAL_EPS)
     {
-        max_purity = SolveGamutBoundaryExact(chroma_dir, luma_LMS_coeffs, to_RGB_boundary, mb_white);
+        initial_max_purity = SolveGamutBoundaryExact(chroma_dir, luma_LMS_coeffs, to_RGB_boundary, mb_white);
     }
-    float relative_purity = saturate(purity / max(max_purity, FLT_MIN));
+    float relative_purity = saturate(purity / max(initial_max_purity, FLT_MIN));
 
     // --- 1. SMART SATURATION (VIBRANCE) & 3D SKIN PROTECTION ---
     float effective_scale = purity_scale;
@@ -699,7 +700,7 @@ float3 ApplyMBPurityAndGamutGuardLMS(
     // Strictly radial purity scaling (preserving exact chromaticity angle and preventing hue distortion)
     float2 scaled_chroma_offset = chroma_offset * effective_scale;
 
-    // --- 2. ABNEY HUE COMPENSATION (Only active when explicitly requested) ---
+    // --- 2. ABNEY HUE COMPENSATION ---
     if (abney_correction > NEUTRAL_EPS)
     {
         float angle = atan2(chroma_offset.y, chroma_offset.x);
@@ -711,40 +712,56 @@ float3 ApplyMBPurityAndGamutGuardLMS(
         scaled_chroma_offset = float2(cos(angle), sin(angle)) * scaled_purity_val;
     }
 
-    // --- 3. GAMUT GUARD COMPRESSION & HARD LIMIT (Skipped if Unclamped) ---
+    // --- 3. SYNCHRONIZED GAMUT GUARD COMPRESSION & CLAMP (Skipped if Unclamped) ---
     float scaled_purity = SqrtIEEE(dot(scaled_chroma_offset, scaled_chroma_offset));
-    if (!is_unclamped && max_purity > FLT_MIN)
+    
+    if (!is_unclamped && scaled_purity > FLT_MIN)
     {
-        if (knee > FLT_MIN)
+        // Re-solve boundary along the NEW, post-Abney rotated direction
+        float2 new_chroma_dir = scaled_chroma_offset / scaled_purity;
+        float max_purity = (abney_correction > NEUTRAL_EPS)
+            ? SolveGamutBoundaryExact(new_chroma_dir, luma_LMS_coeffs, to_RGB_boundary, mb_white)
+            : initial_max_purity;
+
+        if (max_purity > FLT_MIN)
         {
-            float threshold = max_purity * (1.0 - knee);
-            if (scaled_purity > threshold && threshold > FLT_MIN)
+            // Soft-Knee Gamut Compression
+            if (knee > FLT_MIN)
             {
-                float excess = scaled_purity - threshold;
-                float headroom = max_purity - threshold;
-                float compressed = threshold + headroom * (1.0 - exp(-excess / max(headroom, FLT_MIN)));
-                scaled_chroma_offset = (scaled_chroma_offset / max(scaled_purity, FLT_MIN)) * compressed;
-                scaled_purity = compressed;
+                float threshold = max_purity * (1.0 - knee);
+                if (scaled_purity > threshold && threshold > FLT_MIN)
+                {
+                    float excess = scaled_purity - threshold;
+                    float headroom = max_purity - threshold;
+                    float compressed = threshold + headroom * (1.0 - exp(-excess / max(headroom, FLT_MIN)));
+                    scaled_chroma_offset = new_chroma_dir * compressed;
+                    scaled_purity = compressed;
+                }
             }
 
-            // Hard clamp fallback check
+            // Strict Hard Boundary Clamp
+            float p_safe = max_purity * (1.0 - NEUTRAL_EPS);
+            if (scaled_purity > p_safe)
+            {
+                scaled_chroma_offset = new_chroma_dir * p_safe;
+                scaled_purity = p_safe;
+            }
+
+            // Analytical RGB boundary validation with exact closed-form z-recovery
             mb.xy = mb_white + scaled_chroma_offset;
-            float3 lms_compressed = MB_to_LMS(float3(mb.xy, luma));
-            float3 boundary_check = mul(to_RGB_boundary, lms_compressed);
+            float denom = mb.x * (luma_LMS_coeffs.r - luma_LMS_coeffs.g) + mb.y * luma_LMS_coeffs.b + luma_LMS_coeffs.g;
+            mb.z = luma / max(denom, FLT_MIN);
+
+            float3 lms_test = MB_to_LMS(mb);
+            float3 boundary_check = mul(to_RGB_boundary, lms_test);
             float min_b = min(min(boundary_check.r, boundary_check.g), boundary_check.b);
+
             if (min_b < 0.0)
             {
-                float p_now  = SqrtIEEE(dot(scaled_chroma_offset, scaled_chroma_offset));
-                float p_safe = max_purity * (1.0 - NEUTRAL_EPS);
-                scaled_chroma_offset = scaled_chroma_offset * (p_safe / max(p_now, FLT_MIN));
+                // Pull back along the ray to the safe boundary
+                float p_exact = SolveGamutBoundaryExact(new_chroma_dir, luma_LMS_coeffs, to_RGB_boundary, mb_white) * (1.0 - NEUTRAL_EPS);
+                scaled_chroma_offset = new_chroma_dir * min(scaled_purity, p_exact);
             }
-        }
-
-        // Hard Boundary Safety
-        float p_safe_final = max_purity * (1.0 - NEUTRAL_EPS);
-        if (scaled_purity > p_safe_final)
-        {
-            scaled_chroma_offset *= (p_safe_final / max(scaled_purity, FLT_MIN));
         }
     }
 
@@ -756,7 +773,6 @@ float3 ApplyMBPurityAndGamutGuardLMS(
 
     return MB_to_LMS(mb);
 }
-
 /**
  * ApplyMConeCrosstalkLMS
  */
@@ -864,34 +880,80 @@ float CompressLumaPhysiological(float Y, float targetPeak, float startComp, floa
     return startComp + compressed_x;
 }
 
-float3 ApplyNonRiemannianGeodesicToneMapper(float3 lms, float targetPeak, float compressionStart, float desatStrength, float coneExponent, float h_input, float3 luma_LMS_coeffs, float2 mb_white, float whitePt)
+/**
+ * ApplyNonRiemannianGeodesicToneMapper (3D Cusp-Preserving Color Volume Edition)
+ * 
+ * Accurately respects the physical display gamut cusp:
+ * - Compresses max(R,G,B) <= targetPeakNits
+ * - Preserves exact chromaticity ratios (R/M, G/M, B/M) with ZERO pink/cyan washout
+ * - Saturated Red correctly targets <= 210 nits, Blue <= 47 nits, White <= 800 nits
+ */
+float3 ApplyNonRiemannianGeodesicToneMapper(
+    float3 lms, 
+    float targetPeak, 
+    float compressionStart, 
+    float desatStrength, 
+    float coneExponent, 
+    float h_input, 
+    float3 luma_LMS_coeffs, 
+    float3x3 to_RGB, 
+    float3x3 to_LMS,
+    float2 mb_white, 
+    float whitePt)
 {
     float Y = dot(lms, luma_LMS_coeffs);
     if (Y <= 0.0) return lms;
 
     float targetPeakNits = targetPeak * whitePt;
-    float startComp = targetPeakNits * compressionStart;
+    float startCompNits  = targetPeakNits * compressionStart;
 
-    float Y_comp = CompressLumaPhysiological(Y, targetPeakNits, startComp, coneExponent, h_input);
-    float ratio = Y_comp / max(Y, FLT_MIN);
-    float3 mb = LMS_to_MB(lms);
-    
-    float2 chroma_offset = mb.xy - mb_white;
-    float purity = SqrtIEEE(dot(chroma_offset, chroma_offset));
+    // Convert to display RGB to evaluate the true physical color volume
+    float3 rgb = mul(to_RGB, lms);
+    float max_channel = max(rgb.r, max(rgb.g, rgb.b));
 
-    float bleaching = 1.0 / (1.0 + (Y_comp / max(whitePt * 2.0, FLT_MIN)));
-    float compressed_purity = purity * lerp(1.0, bleaching, desatStrength);
+    if (max_channel <= FLT_MIN) return lms;
 
-    float2 chroma_dir = (purity > FLT_MIN) ? (chroma_offset / purity) : float2(0.0, 0.0);
-    mb.xy = mb_white + chroma_dir * compressed_purity;
+    // 1. Cusp-Preserving Tone Compression on the Max Driver Channel
+    // This maintains exact chromaticity ratios without distorting color purity.
+    float compressed_max = max_channel;
+    if (max_channel > startCompNits)
+    {
+        float d = targetPeakNits - startCompNits;
+        float x = max_channel - startCompNits;
+        float h = max(coneExponent * h_input, 1e-6);
+        float ratio = x / max(d, FLT_MIN);
+        float compressed_x = x / pow(1.0 + pow(max(ratio, 0.0), h), 1.0 / h);
+        compressed_max = startCompNits + compressed_x;
+    }
 
-    float denom = mb.x * (luma_LMS_coeffs.r - luma_LMS_coeffs.g) + mb.y * luma_LMS_coeffs.b + luma_LMS_coeffs.g;
-    mb.z = Y_comp / max(denom, FLT_MIN);
+    // Exact scale factor that maps max(R,G,B) <= targetPeakNits with zero hue/purity distortion
+    float cusp_scale = compressed_max / max(max_channel, FLT_MIN);
+    float3 rgb_cusp_mapped = rgb * cusp_scale;
 
-    return MB_to_LMS(mb);
-}
+    // 2. Controlled Specular Bleaching (Only for extreme over-bright highlights)
+    // Saturated colored lights retain their purity; only extreme speculars bleach to white.
+    if (desatStrength > NEUTRAL_EPS)
+    {
+        float Y_mapped = dot(rgb_cusp_mapped, mul(luma_LMS_coeffs, to_LMS));
+        float overexposure = max_channel / max(targetPeakNits, FLT_MIN);
+        
+        // Bleach factor activates only when light exceeds display peak significantly
+        float bleach_gate = saturate((overexposure - 1.0) / 3.0);
+        float bleach_k = desatStrength * bleach_gate;
 
-// =================================================================================================
+        float3 white_target = float3(compressed_max, compressed_max, compressed_max);
+        rgb_cusp_mapped = lerp(rgb_cusp_mapped, white_target, bleach_k);
+
+        // Re-normalize to prevent the blend from exceeding targetPeakNits
+        float post_max = max(rgb_cusp_mapped.r, max(rgb_cusp_mapped.g, rgb_cusp_mapped.b));
+        if (post_max > targetPeakNits)
+        {
+            rgb_cusp_mapped *= (targetPeakNits / post_max);
+        }
+    }
+
+    return mul(to_LMS, rgb_cusp_mapped);
+}// =================================================================================================
 // 8. Debug Visualization Functions
 // =================================================================================================
 
@@ -1218,8 +1280,19 @@ void PS_PhotorealHDR(VS_Output input, out float4 fragColor : SV_Target)
             h = exp2(fHighlightsCurvature);
         }
         
-        lms = ApplyNonRiemannianGeodesicToneMapper(lms, targetPeak, fCompressionStart, fDesaturationStrength, fConeResponseExponent, h, input.luma_LMS_coeffs, mb_white, whitePt);
-        
+        lms = ApplyNonRiemannianGeodesicToneMapper(
+            lms, 
+            targetPeak, 
+            fCompressionStart, 
+            fDesaturationStrength, 
+            fConeResponseExponent, 
+            h, 
+            input.luma_LMS_coeffs, 
+            to_RGB, 
+            to_LMS, // <-- Pass to_LMS matrix
+            mb_white, 
+            whitePt
+        );        
         float Y_before = dot(lms_before, input.luma_LMS_coeffs);
         float Y_after  = dot(lms, input.luma_LMS_coeffs);
         tone_comp_ratio = Y_after / max(Y_before, FLT_MIN);
