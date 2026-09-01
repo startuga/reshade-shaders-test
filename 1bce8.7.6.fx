@@ -1088,7 +1088,6 @@ void WriteDebugOut(int2 pos, float3 dbg, float alpha)
         _dist_sq += _d_chroma_sq * (BCE_CHROMA_CONDITIONING_ACC * BCE_CHROMA_CONDITIONING_ACC)                                  \
                     * _chroma_reliability * inv_2_sigma_c_sq;                                                                  \
     }                                                                                                                          \
-    _dist_sq = ApplyNonRiemannianMetric(_dist_sq, 1.0);                                                                        \
     float _exponent = -(float((x_coord) * (x_coord)) * inv_2_sigma_s_sq + spatial_y) - _dist_sq;                                \
     if (_exponent > BCE_LN_FLT_MIN)                                                                                            \
     {                                                                                                                          \
@@ -1463,7 +1462,16 @@ void CS_BilateralContrast(uint3 id : SV_DispatchThreadID, uint3 tid : SV_GroupTh
         return;
     }
 
-    float enhanced_log = log2_center + strength * diff;
+    // Aplicação correta de saturação perceptual de Bujack no detalhe extraído:
+    float compressed_diff = diff;
+    [branch]
+    if (bNonRiemannianPerception)
+    {
+        float g = clamp(fDiminishingReturnsExponent, 0.05, 2.0);
+        compressed_diff = sign(diff) * log(1.0 + pow(abs(diff), g)) / g;
+    }
+
+    float enhanced_log = log2_center + strength * compressed_diff;
     float enhanced_luma = exp2(enhanced_log);
     float ratio = clamp(enhanced_luma / max(luma_lin, BCE_FLT_MIN), RATIO_MIN, RATIO_MAX);
     float3 final_color = color_lin * ratio;
