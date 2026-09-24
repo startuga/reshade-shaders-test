@@ -41,6 +41,9 @@
     #error "Bilateral Contrast requires ReShade 4.8.0 or newer for Compute Shader support."
 #endif
 
+// Set to 1: True IEEE 754 precision (Mastering Standard - No precision loss)
+// Set to 0: 16-bit Float (Faster, uses 50% less VRAM, minor sub-pixel precision loss)
+// Note: Visible in ReShade UI Preprocessor Definitions dialogue (>= 8 characters).
 #ifndef PREPASS_USE_RGBA32F
     #define PREPASS_USE_RGBA32F 0
 #endif
@@ -51,14 +54,17 @@
     #define PREPASS_FORMAT RGBA16F
 #endif
 
+// Set to 1 on devices that only provide the Vulkan minimum of 16384 bytes of
+// groupshared memory. Reduces the LDS footprint from 16.9 KB to exactly 16 KB by
+// removing the bank-conflict padding.
 #ifndef BCE_COMPAT_VULKAN_MIN_LDS
     #define BCE_COMPAT_VULKAN_MIN_LDS 0
 #endif
 
 #if BCE_COMPAT_VULKAN_MIN_LDS
-    #define LDS_STRIDE 32
+    #define LDS_STRIDE 32 // 4 x 1024 x 4 B = 16384 B exactly (Vulkan spec minimum)
 #else
-    #define LDS_STRIDE 33
+    #define LDS_STRIDE 33 // (y*33 + x) mod 32 = (y+x) mod 32: conflict-free columns
 #endif
 
 // ==============================================================================
@@ -77,15 +83,18 @@ static const int LDS_RADIUS                = LDS_HALO;
 static const float RATIO_MIN               = 0.0001;
 static const float RATIO_MAX               = 10000.0;
 
-static const float BCE_CHROMA_REL_START    = 4.8828125e-4;
-static const float BCE_CHROMA_REL_FULL     = 1.953125e-3;
-static const float BCE_INV_CHROMA_REL_SPAN = 2048.0 / 3.0;
+// Chroma reliability fade-in, expressed in NORMALIZED luma (fraction of active white point).
+static const float BCE_CHROMA_REL_START    = 4.8828125e-4;      // 2^-11 of active white
+static const float BCE_CHROMA_REL_FULL     = 1.953125e-3;       // 2^-9  of active white
+static const float BCE_INV_CHROMA_REL_SPAN = 2048.0 / 3.0;      // 1 / (FULL - START), exact in binary
 static const float EDGE_LUMA_FLOOR         = 1e-4;
 static const float LOG2_EDGE_LUMA_FLOOR    = -13.2877123795;
 
+// Neutral passthrough: |delta log2| * |strength| below this cannot perturb an 8-bit output
 static const float BCE_NEUTRAL_LOG2_EPS    = 1e-7;
 
-static const float BCE_CHROMA_CONDITIONING_ACC = 7.0710678;
+// Linear conditioning for ICtCp chroma in bilateral accumulator
+static const float BCE_CHROMA_CONDITIONING_ACC = 7.0710678; // 5*sqrt(2)
 static const float BCE_CHROMA_EDGE_GAIN        = 12.0;
 static const float BCE_CHROMA_CONDITIONING     = 100.0;
 
@@ -95,24 +104,28 @@ static const float SRGB_THRESHOLD_OETF     = (0.04045 / 12.92);
 static const float3 Luma709                = float3(0.2126, 0.7152, 0.0722);
 static const float3 Luma2020               = float3(0.2627, 0.6780, 0.0593);
 
+// Standard Rec.709 to Rec.2020 Linear Transformation Matrix
 static const float3x3 RGB709_to_2020 = float3x3(
     0.6274040, 0.3292830, 0.0433130,
     0.0690970, 0.9195440, 0.0113590,
     0.0163910, 0.0880130, 0.8955960
 );
 
+// ITU-R BT.2100 / BT.2124 Rec.2020 to HPE LMS Matrix
 static const float3x3 RGB_to_LMS = float3x3(
     1688.0 / 4096.0, 2146.0 / 4096.0,  262.0 / 4096.0,
      683.0 / 4096.0, 2951.0 / 4096.0,  462.0 / 4096.0,
       99.0 / 4096.0,  309.0 / 4096.0, 3688.0 / 4096.0
 );
 
+// ITU-R BT.2100 / BT.2124 LMS' to ICtCp Matrix
 static const float3x3 LMS_to_ICtCp = float3x3(
     0.5,            0.5,             0.0,
     1.61376953125, -3.323486328125,  1.709716796875,
     4.378173828125, -4.24560546875,  -0.132568359375
 );
 
+// ST.2084 (PQ) EOTF Constants (SMPTE ST 2084-2014)
 static const float PQ_M1             = 0.1593017578125;
 static const float PQ_M2             = 78.84375;
 static const float PQ_C1             = 0.8359375;
@@ -120,8 +133,10 @@ static const float PQ_C2             = 18.8515625;
 static const float PQ_C3             = 18.6875;
 static const float PQ_PEAK_LUMINANCE = 10000.0;
 
+// scRGB Standard Definition (1.0 linear = 80 nits)
 static const float SCRGB_WHITE_NITS  = 80.0;
 
+// Exact Photographic Zones
 static const float ZONE_I    = 0.04419417382;
 static const float ZONE_II   = 0.06250000000;
 static const float ZONE_III  = 0.08838834764;
@@ -179,6 +194,7 @@ sampler2D SamplerBackBuffer
     AddressV  = CLAMP;
 };
 
+// pooled = true per REFERENCE.md: re-uses texture memory across effects
 texture2D TexLinearData < pooled = true; > { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = PREPASS_FORMAT; };
 sampler2D SamplerLinearData
 {
@@ -405,6 +421,7 @@ uniform float fChromaEdgeStrength <
     ui_type = "slider";
     ui_label = "Chroma Edge Influence";
     ui_min = 0.0; ui_max = 1.0; ui_step = 0.01;
+    ui_tooltip = "Controls how strongly chroma edges reduce the filter radius.\n0.0 = Luma only. 1.0 = Max(Luma, ICtCp Chroma).";
     ui_category = "Adaptive Radius";
 > = 0.40;
 
@@ -435,9 +452,13 @@ uniform int iColorSpaceOverride <
     ui_type = "combo";
     ui_label = "Color Space Override";
     ui_items = "Auto (Default)\0sRGB (SDR)\0scRGB (HDR Linear)\0HDR10 (PQ)\0HLG (HDR)\0";
+    ui_tooltip = "Selects the EOTF/OETF used for decoding.\n'Auto' uses BUFFER_COLOR_SPACE definition.\nscRGB assumes 1.0 = 80 nits.\n\n"
+                 "HLG highlights above nominal 1000 nits require an FP16 (16-bit) backbuffer;\n"
+                 "on 8/10-bit UNORM backbuffers they are clamped to signal 1.0.";
     ui_category = "System";
 > = 0;
 
+// Compiles out debug UI when ReShade is in Performance Mode
 #if !defined(__RESHADE_PERFORMANCE_MODE__) || !__RESHADE_PERFORMANCE_MODE__
 uniform int iDebugMode <
     ui_type = "combo";
@@ -586,11 +607,22 @@ float3 DecodeToLinear(float3 encoded)
     int space = (iColorSpaceOverride > 0) ? iColorSpaceOverride : BUFFER_COLOR_SPACE;
 
     [branch]
-    if (space == 4) return HLG_EOTF(encoded);
+    if (space == 4)
+    {
+        return HLG_EOTF(encoded);
+    }
+
     [branch]
-    if (space == 3) return PQ_EOTF(encoded);
+    if (space == 3)
+    {
+        return PQ_EOTF(encoded);
+    }
+
     [branch]
-    if (space == 2) return encoded * SCRGB_WHITE_NITS;
+    if (space == 2)
+    {
+        return encoded * SCRGB_WHITE_NITS;
+    }
 
     return sRGB_EOTF(encoded) * SCRGB_WHITE_NITS;
 }
@@ -600,11 +632,22 @@ float3 EncodeFromLinear(float3 lin)
     int space = (iColorSpaceOverride > 0) ? iColorSpaceOverride : BUFFER_COLOR_SPACE;
 
     [branch]
-    if (space == 4) return HLG_OETF(lin);
+    if (space == 4)
+    {
+        return HLG_OETF(lin);
+    }
+
     [branch]
-    if (space == 3) return PQ_InverseEOTF(lin);
+    if (space == 3)
+    {
+        return PQ_InverseEOTF(lin);
+    }
+
     [branch]
-    if (space == 2) return lin / SCRGB_WHITE_NITS;
+    if (space == 2)
+    {
+        return lin / SCRGB_WHITE_NITS;
+    }
 
     return sRGB_OETF(lin / SCRGB_WHITE_NITS);
 }
@@ -840,7 +883,7 @@ float LaplacianOfGaussianShared(int2 local_center)
             response += luma * LoG_Kernel[idx];
         }
     }
-    return response * response * 0.00390625;
+    return response * response * 0.00390625; // Fixed normalization: 1/256
 }
 
 float StructureTensorShared(int2 local_center)
@@ -1287,6 +1330,7 @@ void CS_BilateralContrast(uint3 id : SV_DispatchThreadID, uint3 tid : SV_GroupTh
             float y_f = float(y);
             int x_limit_circ = (int)TrueSqrt(max(0.0, r_limit_sq - y_f * y_f));
 
+            // Left Wing
             int left_end = min(x_limit_circ, -LDS_RADIUS - 1);
             [loop]
             for (int x = -x_limit_circ; x <= left_end; ++x)
@@ -1296,6 +1340,7 @@ void CS_BilateralContrast(uint3 id : SV_DispatchThreadID, uint3 tid : SV_GroupTh
                 BCE_ACCUMULATE_MULTISCALE(n_data, x, y);
             }
 
+            // Right Wing
             int right_start = LDS_RADIUS + 1;
             [loop]
             for (int x = right_start; x <= x_limit_circ; ++x)
