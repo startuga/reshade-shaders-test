@@ -31,13 +31,14 @@
 //     binary-rational float32 weights — eliminates 8-bit GPU TMU bilinear quantization and
 //     odd-resolution half-texel drift (e.g., 1080p, 1440p, ultrawide, arbitrary window sizes).
 //   - Algebraically stabilized Safdar (2017) JzAzBz and SMPTE ST 2084 PQ non-linearities
-//     (5th-order log1p/expm1 Taylor branches within |u|, w < 0.02 + cancellation-free
+//     (5th-order log1p/expm1 Taylor branches within |u|, w < 0.05 + cancellation-free
 //     (1 - c1) + c3*(1 - vp) inverse denominator + 64-bit pre-folded RGB<->LMS matrices),
 //     eliminating float32 cancellation near black and cutting near-peak HDR primary round-trip
-//     error by >35x while maintaining <1.5e-9 Taylor truncation error at branch boundaries.
+//     error by >35x while maintaining <3.5e-7 Taylor truncation error at branch boundaries.
 //   - Native SDR & HDR support via BUFFER_COLOR_SPACE (sRGB/Rec.709, scRGB wide-gamut FP16,
-//     HDR10 ST2084 PQ / Rec.2020, HDR10 BT.2100 HLG / Rec.2020) with automatic per-frame HDR
-//     peak ceiling detection so highlights >1000 nits are never compared against a clamped slice.
+//     HDR10 ST2084 PQ / Rec.2020, HDR10 BT.2100 HLG / Rec.2020) with temporally smoothed
+//     per-frame HDR peak detection (fast attack / slow release, single-pixel spark rejection)
+//     so highlights >1000 nits are filtered cleanly without frame-to-frame shimmer.
 //   - Adaptive Constant-(Jz, h_z) Soft-Knee Gamut Mapping: unchanged in-gamut saturated colors
 //     (including pure primaries) pass through intact with 0 LSB shift while newly out-of-gamut
 //     excursions roll off smoothly.
@@ -296,8 +297,10 @@ uniform int GamutMappingMode <
     ui_tooltip = "Controls how out-of-gamut colors are mapped back into the target RGB gamut:\n"
                  "  JzAzBz Adaptive Soft Roll-Off: Adapts the C1 hyperbolic soft-knee to max(knee, rho_orig)\n"
                  "    at exact constant (Jz, hue h_z), so already-in-gamut saturated colors (including pure\n"
-                 "    primaries) are never desaturated when unchanged, while newly pushed excursions roll\n"
-                 "    off smoothly into Rec.709 (SDR) or Rec.2020 (HDR10/HLG/scRGB).\n"
+                 "    primaries) pass through unchanged, while newly pushed excursions roll off smoothly\n"
+                 "    into Rec.709 (SDR) or Rec.2020 (HDR10/HLG/scRGB). Note: in scRGB, inputs already\n"
+                 "    outside Rec.2020 project directly to the Rec.2020 boundary (same as Hard Boundary);\n"
+                 "    select Unrestricted Wide Gamut to preserve colors beyond Rec.2020.\n"
                  "  JzAzBz Hard Boundary: Exact constant-(Jz, h_z) projection onto gamut boundary;\n"
                  "    100% untouched inside gamut.\n"
                  "  Linear RGB Luminance-Preserving: Fast desaturation toward luminance Y in linear\n"
@@ -377,10 +380,10 @@ uniform float HDRPaperWhiteNits <
 
 uniform bool AutoDetectHDRPeak <
     ui_category = "SDR / HDR Color Space";
-    ui_label = "Auto-Detect Frame HDR Peak";
-    ui_tooltip = "Measures the exact maximum Jz across every pixel of each HDR frame so all specular\n"
-                 "highlights (2000-10000 nits) sit inside the FLLF slice range and are filtered against\n"
-                 "their true local level with maximum slice density. Inactive in SDR.";
+    ui_label = "Auto-Detect Frame HDR Peak (Smoothed)";
+    ui_tooltip = "Tracks the HDR peak Jz across each frame with single-pixel spark rejection and\n"
+                 "asymmetric temporal smoothing (~0.1s attack / ~1.0s release) so highlights (2000-10000 nits)\n"
+                 "are filtered at their true local level without frame-to-frame shimmer. Inactive in SDR.";
 > = true;
 
 uniform float HDRPeakNits <
@@ -437,6 +440,9 @@ uniform float SplitPosition <
     ui_max = 1.00;
     ui_step = 0.005;
 > = 0.50;
+
+// ReShade built-in frame delta time in milliseconds (used for temporal HDR peak smoothing)
+uniform float FrameTime < source = "frametime"; >;
 
 // =================================================================================================
 // Isolated Implementation Namespace
@@ -571,6 +577,11 @@ namespace FLLF_JzAzBz
     sampler2D SampPeak3 { Texture = TexPeak3; MinFilter = POINT; MagFilter = POINT; MipFilter = POINT; AddressU = CLAMP; AddressV = CLAMP; };
     texture2D TexPeak4 { Width = 1; Height = 1; Format = R32F; };
     sampler2D SampPeak4 { Texture = TexPeak4; MinFilter = POINT; MagFilter = POINT; MipFilter = POINT; AddressU = CLAMP; AddressV = CLAMP; };
+    // Persistent 1x1 temporal smoothing textures (non-pooled; 8 bytes total)
+    texture2D TexPeakSmooth { Width = 1; Height = 1; Format = R32F; };
+    sampler2D SampPeakSmooth { Texture = TexPeakSmooth; MinFilter = POINT; MagFilter = POINT; MipFilter = POINT; AddressU = CLAMP; AddressV = CLAMP; };
+    texture2D TexPeakPrev { Width = 1; Height = 1; Format = R32F; };
+    sampler2D SampPeakPrev { Texture = TexPeakPrev; MinFilter = POINT; MagFilter = POINT; MipFilter = POINT; AddressU = CLAMP; AddressV = CLAMP; };
 
     // Scalar Jz Gaussian Pyramid (G1..G{L-2}) — reused bottom-up as Collapse targets O{L-3}..O1
     texture2D TexG1 { Width = _FLLF_W1; Height = _FLLF_H1; Format = R32F; };
@@ -691,9 +702,9 @@ namespace FLLF_JzAzBz
         float x = SafePow(max(nitsVal, 0.0f) * 1.0e-4f, PQ_M1);
         float w = (PQ_K_NB * x) / (1.0f + PQ_C3 * x);
         float res;
-        if (w < 0.02f)
+        if (w < 0.05f)
         {
-            // Near-black branch: 5th-order log1p(w) around c1^expPow (<1.5e-9 truncation error)
+            // Near-black branch: 5th-order log1p(w) around c1^expPow (<3.5e-7 truncation error)
             float w2 = w * w;
             float ln1p = w - 0.5f * w2 + (1.0f / 3.0f) * w2 * w - 0.25f * w2 * w2 + 0.2f * w2 * w2 * w;
             res = zeroFloor * exp(expPow * ln1p);
@@ -701,9 +712,9 @@ namespace FLLF_JzAzBz
         else
         {
             float u = (PQ_ONE_M_C1 * (1.0f - x)) / (1.0f + PQ_C3 * x);
-            if (abs(u) < 0.02f)
+            if (abs(u) < 0.05f)
             {
-                // Near-peak branch: 5th-order log1p(-u) around 1.0 (<1.5e-9 truncation error)
+                // Near-peak branch: 5th-order log1p(-u) around 1.0 (<3.5e-7 truncation error)
                 float u2 = u * u;
                 float lnVal = -u - 0.5f * u2 - (1.0f / 3.0f) * u2 * u - 0.25f * u2 * u2 - 0.2f * u2 * u2 * u;
                 res = exp(expPow * lnVal);
@@ -791,12 +802,12 @@ namespace FLLF_JzAzBz
             float ax = -clamped;
             float x = SafePow(ax * 1.0e-4f, PQ_M1);
             float w = (PQ_K_NB * x) / (1.0f + PQ_C3 * x);
-            if (w < 0.02f)
+            if (w < 0.05f)
             {
                 float w2 = w * w;
                 float ln1p = w - 0.5f * w2 + (1.0f / 3.0f) * w2 * w - 0.25f * w2 * w2 + 0.2f * w2 * w2 * w;
                 float a = JZ_P * ln1p;
-                if (a < 0.02f)
+                if (a < 0.05f)
                 {
                     float a2 = a * a;
                     float em1 = a + 0.5f * a2 + (1.0f / 6.0f) * a2 * a + (1.0f / 24.0f) * a2 * a2;
@@ -1065,13 +1076,16 @@ namespace FLLF_JzAzBz
         return LMSNitsToJzAzBz(lmsNits);
     }
 
-    // Evaluates (Iz + s * chromaVec) -> linear Target RGB nits and checks cone & target gamut bounds
+    // Evaluates (Iz + s * chromaVec) -> linear Target RGB nits and checks cone & target gamut bounds.
+    // When useRelTol is true (pass-through checks only), applies a brightness-relative tolerance
+    // (2e-4 * max(peakChannel, 1e-3)) so dark HDR shadows are protected down to ~1e-4 nits while
+    // bright primaries pass through with 0 LSB round-trip drift; bisection always uses exact 0.0.
     bool EvalScaledChromaToRGB(
-        float Iz, float3 chromaVec, float s, float3x3 matLMStoRGB, float maxNits, float tol,
+        float Iz, float3 chromaVec, float s, float3x3 matLMStoRGB, float maxNits, bool useRelTol,
         out float3 outRgb)
     {
         float3 lmsp = Iz + s * chromaVec;
-        float coneTol = tol * 1.0e-8f;
+        float coneTol = useRelTol ? (1.0e-6f * max(Iz, JZ_LMSP_ZERO)) : 0.0f;
         bool inCone = (min(lmsp.x, min(lmsp.y, lmsp.z)) >= (JZ_LMSP_ZERO - coneTol))
                    && (max(lmsp.x, max(lmsp.y, lmsp.z)) <= (1.0f + coneTol));
         outRgb = float3(0.0f, 0.0f, 0.0f);
@@ -1081,8 +1095,10 @@ namespace FLLF_JzAzBz
             float3 lmspClamped = clamp(lmsp, JZ_LMSP_ZERO, 1.0f);
             float3 lms = StabilizedPQInverse3(lmspClamped, JZ_INV_P, JZ_LMSP_ZERO);
             outRgb = mul(matLMStoRGB, lms);
-            ok = (min(outRgb.r, min(outRgb.g, outRgb.b)) >= -tol)
-              && (max(outRgb.r, max(outRgb.g, outRgb.b)) <= (maxNits + tol));
+            float peakCh = max(outRgb.r, max(outRgb.g, outRgb.b));
+            float chTol = useRelTol ? (2.0e-4f * max(peakCh, 1.0e-3f)) : 0.0f;
+            ok = (min(outRgb.r, min(outRgb.g, outRgb.b)) >= -chTol)
+              && (max(outRgb.r, max(outRgb.g, outRgb.b)) <= (maxNits + chTol));
         }
         return ok;
     }
@@ -1100,10 +1116,9 @@ namespace FLLF_JzAzBz
         float Jzd = Jz + JZ_D0;
         float Iz = clamp(Jzd / max(JZ_ONE_P_D - JZ_D * Jzd, 1.0e-20f), JZ_LMSP_ZERO, 1.0f);
         float3 chromaVec = mul(M_IZAZBZ_TO_LMSP, float3(0.0f, jab.y, jab.z));
-        float gamTol = maxNits * 5.0e-5f;
 
         float3 rgb0;
-        bool ok0 = EvalScaledChromaToRGB(Iz, chromaVec, 0.0f, matLMStoRGB, maxNits, gamTol, rgb0);
+        bool ok0 = EvalScaledChromaToRGB(Iz, chromaVec, 0.0f, matLMStoRGB, maxNits, true, rgb0);
         float3 finalRgb = clamp(rgb0, 0.0f, maxNits);
 
         float maxChroma = max(abs(chromaVec.x), max(abs(chromaVec.y), abs(chromaVec.z)));
@@ -1115,11 +1130,11 @@ namespace FLLF_JzAzBz
                 float invKnee = 1.0f / knee;
 
                 float3 rgbKnee;
-                if (EvalScaledChromaToRGB(Iz, chromaVec, invKnee, matLMStoRGB, maxNits, 0.0f, rgbKnee))
+                if (EvalScaledChromaToRGB(Iz, chromaVec, invKnee, matLMStoRGB, maxNits, false, rgbKnee))
                 {
                     // Strictly inside untouched core (rho <= knee): zero bisection, exact pass-through
                     float3 rgb1;
-                    EvalScaledChromaToRGB(Iz, chromaVec, 1.0f, matLMStoRGB, maxNits, gamTol, rgb1);
+                    EvalScaledChromaToRGB(Iz, chromaVec, 1.0f, matLMStoRGB, maxNits, true, rgb1);
                     finalRgb = clamp(rgb1, 0.0f, maxNits);
                 }
                 else
@@ -1133,9 +1148,9 @@ namespace FLLF_JzAzBz
 
                     float sEdgeOrig = invKnee;
                     float3 rgbTmp;
-                    if (!EvalScaledChromaToRGB(IzO, chromaOrig, invKnee, matLMStoRGB, maxNits, 0.0f, rgbTmp))
+                    if (!EvalScaledChromaToRGB(IzO, chromaOrig, invKnee, matLMStoRGB, maxNits, false, rgbTmp))
                     {
-                        if (!EvalScaledChromaToRGB(IzO, chromaOrig, 1.0f, matLMStoRGB, maxNits, 0.0f, rgbTmp))
+                        if (!EvalScaledChromaToRGB(IzO, chromaOrig, 1.0f, matLMStoRGB, maxNits, false, rgbTmp))
                         {
                             sEdgeOrig = 1.0f;
                         }
@@ -1147,7 +1162,7 @@ namespace FLLF_JzAzBz
                             for (int iterO = 0; iterO < 12; ++iterO)
                             {
                                 float midO = 0.5f * (loO + hiO);
-                                if (EvalScaledChromaToRGB(IzO, chromaOrig, midO, matLMStoRGB, maxNits, 0.0f, rgbTmp))
+                                if (EvalScaledChromaToRGB(IzO, chromaOrig, midO, matLMStoRGB, maxNits, false, rgbTmp))
                                     loO = midO;
                                 else
                                     hiO = midO;
@@ -1157,7 +1172,7 @@ namespace FLLF_JzAzBz
                     }
 
                     float3 rgb1;
-                    bool ok1 = EvalScaledChromaToRGB(Iz, chromaVec, 1.0f, matLMStoRGB, maxNits, gamTol, rgb1);
+                    bool ok1 = EvalScaledChromaToRGB(Iz, chromaVec, 1.0f, matLMStoRGB, maxNits, true, rgb1);
                     if (sEdgeOrig <= 1.0f + 1.0e-5f)
                     {
                         // Original pixel was already on/outside gamut boundary -> preserve in-gamut or project cleanly
@@ -1173,17 +1188,17 @@ namespace FLLF_JzAzBz
                             for (int iter = 0; iter < 12; ++iter)
                             {
                                 float mid = 0.5f * (lo + hi);
-                                if (EvalScaledChromaToRGB(Iz, chromaVec, mid, matLMStoRGB, maxNits, 0.0f, rgbTmp))
+                                if (EvalScaledChromaToRGB(Iz, chromaVec, mid, matLMStoRGB, maxNits, false, rgbTmp))
                                     lo = mid;
                                 else
                                     hi = mid;
                             }
                             float3 rgbMapped;
-                            EvalScaledChromaToRGB(Iz, chromaVec, lo, matLMStoRGB, maxNits, 0.0f, rgbMapped);
+                            EvalScaledChromaToRGB(Iz, chromaVec, lo, matLMStoRGB, maxNits, false, rgbMapped);
                             finalRgb = clamp(rgbMapped, 0.0f, maxNits);
                         }
                     }
-                    else if (ok1 && EvalScaledChromaToRGB(Iz, chromaVec, sEdgeOrig, matLMStoRGB, maxNits, gamTol, rgbTmp))
+                    else if (ok1 && EvalScaledChromaToRGB(Iz, chromaVec, sEdgeOrig, matLMStoRGB, maxNits, true, rgbTmp))
                     {
                         // Candidate radius <= max(knee, rho_orig): exact untouched pass-through!
                         finalRgb = clamp(rgb1, 0.0f, maxNits);
@@ -1198,7 +1213,7 @@ namespace FLLF_JzAzBz
                         for (int iter = 0; iter < 12; ++iter)
                         {
                             float mid = 0.5f * (lo + hi);
-                            if (EvalScaledChromaToRGB(Iz, chromaVec, mid, matLMStoRGB, maxNits, 0.0f, rgbTmp))
+                            if (EvalScaledChromaToRGB(Iz, chromaVec, mid, matLMStoRGB, maxNits, false, rgbTmp))
                                 lo = mid;
                             else
                                 hi = mid;
@@ -1213,7 +1228,7 @@ namespace FLLF_JzAzBz
                         float sFinal = min(rhoOut * sEdge, 1.0f);
 
                         float3 rgbMapped;
-                        EvalScaledChromaToRGB(Iz, chromaVec, sFinal, matLMStoRGB, maxNits, 0.0f, rgbMapped);
+                        EvalScaledChromaToRGB(Iz, chromaVec, sFinal, matLMStoRGB, maxNits, false, rgbMapped);
                         finalRgb = clamp(rgbMapped, 0.0f, maxNits);
                     }
                 }
@@ -1221,7 +1236,7 @@ namespace FLLF_JzAzBz
             else
             {
                 float3 rgb1;
-                if (EvalScaledChromaToRGB(Iz, chromaVec, 1.0f, matLMStoRGB, maxNits, gamTol, rgb1))
+                if (EvalScaledChromaToRGB(Iz, chromaVec, 1.0f, matLMStoRGB, maxNits, true, rgb1))
                 {
                     finalRgb = clamp(rgb1, 0.0f, maxNits);
                 }
@@ -1235,14 +1250,14 @@ namespace FLLF_JzAzBz
                     {
                         float mid = 0.5f * (lo + hi);
                         float3 rgbMid;
-                        if (EvalScaledChromaToRGB(Iz, chromaVec, mid, matLMStoRGB, maxNits, 0.0f, rgbMid))
+                        if (EvalScaledChromaToRGB(Iz, chromaVec, mid, matLMStoRGB, maxNits, false, rgbMid))
                             lo = mid;
                         else
                             hi = mid;
                     }
 
                     float3 rgbMapped;
-                    EvalScaledChromaToRGB(Iz, chromaVec, lo, matLMStoRGB, maxNits, 0.0f, rgbMapped);
+                    EvalScaledChromaToRGB(Iz, chromaVec, lo, matLMStoRGB, maxNits, false, rgbMapped);
                     finalRgb = clamp(rgbMapped, 0.0f, maxNits);
                 }
             }
@@ -1464,9 +1479,9 @@ namespace FLLF_JzAzBz
         }
         else if (AutoDetectHDRPeak)
         {
-            float detected = _FLLF_FETCH(SampPeak4, int2(0, 0), int2(1, 1)).r * 1.005f;
+            float smoothed = _FLLF_FETCH(SampPeakSmooth, int2(0, 0), int2(1, 1)).r;
             float floorJz = max(LuminanceNitsToJz(HDRPaperWhiteNits), 0.10f);
-            ceilingJz = clamp(max(detected, floorJz), floorJz, 1.0f - JZ_D0);
+            ceilingJz = clamp(max(smoothed, floorJz), floorJz, 1.0f - JZ_D0);
         }
         else if (cs == 4)
         {
@@ -2000,7 +2015,45 @@ namespace FLLF_JzAzBz
         return float4(jab, raw.a);
     }
 
-    // Exact 4-pass 8x8 full-frame HDR peak Jz reduction (instant 0-fetch bypass in SDR or manual mode)
+    // First-stage 8x8 reduction returning 2nd-brightest pixel per tile to reject isolated 1-px sparks
+    // while preserving 100% exact luminance of any >=2-pixel specular highlight
+    float ReduceRobustPeak8x8(sampler2D src, int2 dstPos, int2 srcSize)
+    {
+        int2 base = dstPos * 8;
+        float m1 = 0.0f;
+        float m2 = 0.0f;
+        int cnt = 0;
+        [loop]
+        for (int dy = 0; dy < 8; ++dy)
+        {
+            int sy = base.y + dy;
+            if (sy < srcSize.y)
+            {
+                [loop]
+                for (int dx = 0; dx < 8; ++dx)
+                {
+                    int sx = base.x + dx;
+                    if (sx < srcSize.x)
+                    {
+                        float v = _FLLF_FETCH(src, int2(sx, sy), srcSize).r;
+                        if (v > m1)
+                        {
+                            m2 = m1;
+                            m1 = v;
+                        }
+                        else if (v > m2)
+                        {
+                            m2 = v;
+                        }
+                        cnt += 1;
+                    }
+                }
+            }
+        }
+        return (cnt >= 2) ? m2 : m1;
+    }
+
+    // Exact 8x8 max reduction for subsequent pyramid levels
     float ReduceMax8x8(sampler2D src, int2 dstPos, int2 srcSize)
     {
         int2 base = dstPos * 8;
@@ -2029,7 +2082,7 @@ namespace FLLF_JzAzBz
         if (AutoDetectHDRPeak && GetActiveColorSpace() != 1)
         {
             int2 p = _FLLF_PIXEL_COORD(vpos, uv, int2(_FLLF_PW1, _FLLF_PH1));
-            res = ReduceMax8x8(SampJzAzBz, p, int2(_FLLF_W0, _FLLF_H0));
+            res = ReduceRobustPeak8x8(SampJzAzBz, p, int2(_FLLF_W0, _FLLF_H0));
         }
         return res;
     }
@@ -2081,6 +2134,36 @@ namespace FLLF_JzAzBz
             }
         }
         return m;
+    }
+
+    // Asymmetric exponential temporal smoothing of HDR peak (~0.10 s attack, ~1.00 s release)
+    float PS_Peak_Smooth(float4 vpos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
+    {
+        float res = 0.0f;
+        if (AutoDetectHDRPeak && GetActiveColorSpace() != 1)
+        {
+            float rawPeak = _FLLF_FETCH(SampPeak4, int2(0, 0), int2(1, 1)).r * 1.005f;
+            float floorJz = max(LuminanceNitsToJz(HDRPaperWhiteNits), 0.10f);
+            float target  = clamp(max(rawPeak, floorJz), floorJz, 1.0f - JZ_D0);
+            float prev    = _FLLF_FETCH(SampPeakPrev, int2(0, 0), int2(1, 1)).r;
+            if (prev <= 1.0e-6f || prev > 1.0f)
+            {
+                res = target;
+            }
+            else
+            {
+                float dt = clamp(FrameTime * 0.001f, 0.0f, 0.25f);
+                float tau = (target > prev) ? 0.10f : 1.00f;
+                float alpha = 1.0f - exp(-dt / tau);
+                res = lerp(prev, target, saturate(alpha));
+            }
+        }
+        return res;
+    }
+
+    float PS_Peak_Store(float4 vpos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
+    {
+        return _FLLF_FETCH(SampPeakSmooth, int2(0, 0), int2(1, 1)).r;
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -2575,10 +2658,12 @@ namespace FLLF_JzAzBz
             PixelShader  = PS_ToJzAzBz;
             RenderTarget = TexJzAzBz;
         }
-        pass Peak_1 { VertexShader = PostProcessVS; PixelShader = PS_Peak_1; RenderTarget = TexPeak1; }
-        pass Peak_2 { VertexShader = PostProcessVS; PixelShader = PS_Peak_2; RenderTarget = TexPeak2; }
-        pass Peak_3 { VertexShader = PostProcessVS; PixelShader = PS_Peak_3; RenderTarget = TexPeak3; }
-        pass Peak_4 { VertexShader = PostProcessVS; PixelShader = PS_Peak_4; RenderTarget = TexPeak4; }
+        pass Peak_1      { VertexShader = PostProcessVS; PixelShader = PS_Peak_1;      RenderTarget = TexPeak1;      }
+        pass Peak_2      { VertexShader = PostProcessVS; PixelShader = PS_Peak_2;      RenderTarget = TexPeak2;      }
+        pass Peak_3      { VertexShader = PostProcessVS; PixelShader = PS_Peak_3;      RenderTarget = TexPeak3;      }
+        pass Peak_4      { VertexShader = PostProcessVS; PixelShader = PS_Peak_4;      RenderTarget = TexPeak4;      }
+        pass Peak_Smooth { VertexShader = PostProcessVS; PixelShader = PS_Peak_Smooth; RenderTarget = TexPeakSmooth; }
+        pass Peak_Store  { VertexShader = PostProcessVS; PixelShader = PS_Peak_Store;  RenderTarget = TexPeakPrev;   }
 
         // Phase 2: Scalar Jz Gaussian pyramid (G1 .. G{L-2})
         pass ReduceJz_01 { VertexShader = PostProcessVS; PixelShader = PS_ReduceJz_01; RenderTarget = TexG1; }
